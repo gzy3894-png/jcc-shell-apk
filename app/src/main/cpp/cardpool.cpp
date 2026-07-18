@@ -803,14 +803,6 @@ static void *worker(void *) {
     return nullptr;
 }
 
-// 占位实现声明在文件内
-static void refresh_hex() {
-    // 保留 g_hex；可由后续 hex 模型填充
-}
-static void refresh_positions() {
-    // 保持 EMPTY 或已有值
-}
-
 extern "C" void jcc_report_owned(int hero_id, int count) {
     if (hero_id <= 0) return;
     pthread_mutex_lock(&g_mu);

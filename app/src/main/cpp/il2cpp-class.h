@@ -1,3 +1,6 @@
+#include <stddef.h>
+#include <stdint.h>
+
 typedef uint16_t Il2CppChar;
 typedef uintptr_t il2cpp_array_size_t;
 typedef int32_t TypeDefinitionIndex;
