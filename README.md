@@ -1,23 +1,30 @@
-# JCC Shell APK（Root 注入，不走 LSP / 不装 Zygisk 模块）
+# JCC Shell APK 2.5.1
 
-普通 APK + `su`：
+**2.5.1 = 2.5.0 的用法 + 当前赛季新数据。**
 
-1. 提取 `JCC.sh` + 我们的 `libJCC.so` 到 `/data/local/tmp`
-2. 启动金铲铲，等 `libil2cpp`
-3. 执行原版注入器把 SO `dlopen` 进游戏
-4. SO 内用当前赛季字段扫 `SearchACGHero*`，起 `127.0.0.1:31338`
-5. App 内「刷新牌库」拉数据；也可读  
+## 你不用懂技术
+
+1. 到 [Releases](https://github.com/gzy3894-png/jcc-shell-apk/releases) 下 **v2.5.1** 的 APK  
+2. 手机有 **Root**  
+3. 安装后打开 App → 按界面启动注入（会自己拉游戏）  
+4. 进**大厅**等一会儿  
+5. 点刷新牌库，或用文件管理器看：  
    `/data/user/0/com.tencent.jkchess/files/jcc_cardpool.txt`
 
-## 你需要
+## 和 2.5.0 啥关系
 
-- Root
-- 金铲铲 `com.tencent.jkchess`
+| | 2.5.0 | 2.5.1 |
+|--|-------|-------|
+| 为啥挂 | 游戏更新，里面数据旧了 | — |
+| 数据 | 旧赛季 | **真机扫的新赛季** |
+| 注入/通信 | 有 | **沿用**（31338、`GET:牌库`） |
+| 你要做的 | — | **装新包测一下** |
+
+## 现在有什么 / 还没有
+
+- **有：** 按新字段读英雄表（id/名/费用/图标），落盘 + 本地协议  
+- **还没有：** 完整 2.5.0 所有悬浮功能、剩余张数实时等（后续迭代）
 
 ## 构建
 
-GitHub Actions → 产物 `jcc-shell-v1.0.0.apk`
-
-## 若注入器与 SO 不匹配
-
-把你手上的 **内存读写 / 注入源码** 丢过来，我按你的接口接 `cardpool` 扫表逻辑。
+Push → Actions → `jcc-shell-v2.5.1.apk` + Release `v2.5.1`

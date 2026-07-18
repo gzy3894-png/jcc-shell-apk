@@ -1,7 +1,8 @@
-// JCC Shell — 从当前赛季 IL2CPP 读 TACG_Hero_Client，提供牌库协议
+// JCC Shell 2.5.1 — 当前赛季牌库（机扫新数据）
 #include "cardpool.h"
 #include "log.h"
 #include "il2cpp-class.h"
+#include "season_offsets.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -20,12 +21,11 @@
 #include "il2cpp-api-functions.h"
 #undef DO_API
 
-// TACG_Hero_Client 字段（dump.cs 2026-07 当前赛季）
-static constexpr size_t OFF_IID = 0x10;
-static constexpr size_t OFF_SNAME = 0x18;
-static constexpr size_t OFF_ICOST = 0x60;
-static constexpr size_t OFF_PAINT_SMALL = 0xf8;
-static constexpr size_t OFF_SETNUM = 0x114;
+static constexpr size_t OFF_IID = JCC_HERO_IID;
+static constexpr size_t OFF_SNAME = JCC_HERO_SNAME;
+static constexpr size_t OFF_ICOST = JCC_HERO_ICOST;
+static constexpr size_t OFF_PAINT_SMALL = JCC_HERO_PAINT_SMALL;
+static constexpr size_t OFF_SETNUM = JCC_HERO_SETNUM;
 
 static constexpr int CTRL_PORT = 31338;
 static constexpr int MAX_HERO_ID = 20000;
@@ -152,8 +152,9 @@ static void sanitize_field(std::string &s) {
 }
 
 static std::string scan_cardpool() {
-    set_status("scan: resolve DataBaseManager");
-    Il2CppClass *db = find_class("ZGame", "DataBaseManager");
+    set_status("scan: resolve DataBaseManager (" JCC_SEASON_TAG ")");
+    Il2CppClass *db = find_class(JCC_NS_DB, JCC_CLS_DB);
+    if (!db) db = find_class("ZGame", "DataBaseManager");
     if (!db) db = find_class("", "DataBaseManager");
     if (!db) {
         set_status("FAIL: DataBaseManager class not found");
