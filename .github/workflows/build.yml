@@ -4,6 +4,9 @@ on:
   push:
     branches: [master, main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -52,6 +55,8 @@ jobs:
             - **游戏内字段数据已更新为 2.5.1 赛季**
             - 剩余张数等高级功能仍在迭代
           files: dist/jcc-shell-v2.5.1.apk
-          generate_release_notes: true
+          generate_release_notes: false
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
