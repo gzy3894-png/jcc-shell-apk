@@ -1332,34 +1332,46 @@ static void *server(void *) {
     return nullptr;
 }
 
-// 进局判定：写明失败原因，便于 log.txt 对照
-// 返回 0=ok，否则错误码
+// 进局判定（匹配页安全）：
+// 禁止对半初始化 battle 调 GetMyPlayerModel —— 会闪退。
+// 顺序：class → instance → GetMyPlayerId → 仅 id 合法再 GetMyPlayerModel
+// 返回 0=ok
 static int battle_probe(char *why, size_t why_n) {
     if (why && why_n) why[0] = 0;
-    Il2CppClass *cbm = nullptr;
-    auto battle = get_battle(&cbm);
+    Il2CppClass *cbm = find_class("ZGameChess", "ChessBattleModel");
+    if (!cbm) cbm = find_class("", "ChessBattleModel");
     if (!cbm) {
-        if (why) snprintf(why, why_n, "no_ChessBattleModel_class");
+        if (why) snprintf(why, why_n, "no_class");
         return 1;
     }
+    Il2CppObject *battle = nullptr;
+    Il2CppClass *cmm = find_class("ZGameChess", "ChessModelManager");
+    if (!cmm) cmm = find_class("", "ChessModelManager");
+    if (cmm) {
+        auto inst = singleton(cmm);
+        auto m = meth(cmm, "GetBattleModel", 0);
+        if (inst && m) battle = inv(m, inst, nullptr);
+    }
+    if (!battle) battle = singleton(cbm);
     if (!battle) {
-        if (why) snprintf(why, why_n, "no_battle_instance");
+        if (why) snprintf(why, why_n, "no_battle");
         return 2;
     }
+
+    // 先轻量取 myId；匹配页常返回 -1/0，此时绝不能再调 GetMyPlayerModel
+    auto mMyId = meth(cbm, "GetMyPlayerId", 0);
+    int myId = -1;
+    if (mMyId) {
+        myId = unbox_i32(inv(mMyId, battle, nullptr));
+    }
+    if (!pid_ok(myId)) {
+        if (why) snprintf(why, why_n, "not_in_match myId=%d", myId);
+        return 3; // 大厅/匹配页：正常，不读局
+    }
+
     auto pm = get_my_pm(battle, cbm);
     if (!pm) {
-        if (why) snprintf(why, why_n, "no_GetMyPlayerModel");
-        return 3;
-    }
-    int myId = get_my_id(battle, cbm);
-    if (!pid_ok(myId)) {
-        // 尝试从 PM 字段直接读
-        int pid = *(int *)((char *)pm + JCC_PM_PLAYER_ID);
-        if (pid_ok(pid)) {
-            if (why) snprintf(why, why_n, "ok_via_pm_field id=%d", pid);
-            return 0;
-        }
-        if (why) snprintf(why, why_n, "bad_myId=%d", myId);
+        if (why) snprintf(why, why_n, "no_pm id=%d", myId);
         return 4;
     }
     if (why) snprintf(why, why_n, "ok id=%d", myId);
@@ -1372,21 +1384,21 @@ static bool battle_stable() {
 }
 
 static void *worker(void *) {
-    // 冷却缩短：原版 hooks 已跑完，过长只会一直 lobby
-    JLOGI("worker cool-down 8s");
-    sleep(8);
+    // 匹配页零 IL2CPP 对局调用；只扫一次牌库
+    JLOGI("worker cool-down 10s (matchmaking safe)");
+    sleep(10);
     ensure_il2cpp_thread();
     JCKPT("worker_start_safe");
 
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 15; i++) {
         if (scan_heroes()) break;
-        sleep(5);
+        sleep(4);
     }
 
     int tick = 0;
     int stable_hits = 0;
     while (g_run.load()) {
-        sleep(2);
+        sleep(3); // 匹配页更慢探，降低闪退概率
         tick++;
         ensure_il2cpp_thread();
 
@@ -1405,14 +1417,14 @@ static void *worker(void *) {
                 g_warn = "EMPTY";
             }
             g_overlay_ready.store(false);
-            // 每 15s 打一次原因（进对局后若仍失败好查）
-            if ((tick % 8) == 0)
-                JLOGI("hb lobby code=%d why=%s", code, why);
+            if ((tick % 5) == 0) JLOGI("hb lobby code=%d why=%s", code, why);
             continue;
         }
-        // 连续 1 次即可（已在对局）
-        if (stable_hits < 1) continue;
-        if ((tick % 8) == 1) JLOGI("hb IN_BATTLE %s", why);
+        if (stable_hits < 2) {
+            if (stable_hits == 1) JLOGI("hb almost_battle %s", why);
+            continue;
+        }
+        if ((tick % 5) == 1) JLOGI("hb IN_BATTLE %s", why);
 
         if (g_shop_show.load() && g_pool.empty() && (tick % 20) == 0) scan_heroes();
 

@@ -12,7 +12,7 @@
 #include <unistd.h>
 
 static void *boot_thread(void *) {
-    JLOGI("boot_thread full-1.0.7 path=%s", JccFileLog::I().path());
+    JLOGI("boot_thread v1.1.1 path=%s", JccFileLog::I().path());
 
     // TCP 先起：不依赖 il2cpp，Controller 连上就能看到版本日志
     cardpool_start_server_only();
@@ -27,7 +27,7 @@ static void *boot_thread(void *) {
             il2cpp_api_init(handle);
             sleep(8); // 再错开进局资源加载
             cardpool_start_worker();
-            JLOGI("worker_started full-1.0.7");
+            JLOGI("worker_started v1.1.1");
             return nullptr;
         }
         if ((i % 10) == 0) JLOGI("wait_il2cpp %d", i);
