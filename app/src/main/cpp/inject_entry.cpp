@@ -1,45 +1,41 @@
 // 被 JCC.sh / ptrace dlopen 进游戏进程后自动跑
+// 注意：加载阶段禁止狂扫 IL2CPP，否则易「资源错误」
 #include "cardpool.h"
 #include "il2cpp_dump.h"
 #include "jcc_log.h"
 #include "log.h"
 #include "xdl.h"
 
-#include <cstdio>
 #include <pthread.h>
 #include <unistd.h>
 
-static const char *kDataDir = "/data/user/0/com.tencent.jkchess";
-
 static void *boot_thread(void *) {
-    JccFileLog::I().init(kDataDir);
-    JCKPT("inject_boot_start");
-    JLOGI("inject_entry boot_thread");
+    // 日志只写 Download/jcc-scan/jcc.log（不写游戏目录）
+    JccFileLog::I().init(nullptr);
+    JLOGI("inject_boot path=%s", JccFileLog::I().path());
 
-    for (int i = 0; i < 180; i++) {
+    // 等游戏完成基础加载，再碰 libil2cpp（避免进局加载页资源错误）
+    sleep(8);
+
+    for (int i = 0; i < 120; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            JLOGI("libil2cpp +%ds", i);
-            JCKPT("libil2cpp_found");
+            JLOGI("libil2cpp ready +%ds", i + 8);
             il2cpp_api_init(handle);
-            JCKPT("il2cpp_api_init_done");
-            cardpool_start(kDataDir);
-            JCKPT("cardpool_start_returned");
+            // 再等一会儿再起业务线程，错开「匹配成功→加载资源」高峰
+            sleep(5);
+            cardpool_start(nullptr);
             return nullptr;
         }
-        if (i % 10 == 0) JLOGI("wait il2cpp %d", i);
+        if (i % 15 == 0) JLOGI("wait il2cpp %d", i);
         sleep(1);
     }
-    JLOGE("FAIL: libil2cpp not found");
-    JCKPT("libil2cpp_timeout");
+    JLOGE("FAIL libil2cpp not found");
     return nullptr;
 }
 
 __attribute__((constructor)) static void on_load() {
-    // 最早落盘，防断线丢状态
-    JccFileLog::I().init(kDataDir);
-    JCKPT("constructor");
-    JLOGI("libJCC.so constructor full-kernel");
+    // constructor 里只起线程，不做任何游戏调用、不写游戏目录
     pthread_t t;
     pthread_create(&t, nullptr, boot_thread, nullptr);
     pthread_detach(t);

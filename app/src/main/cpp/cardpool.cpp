@@ -368,17 +368,8 @@ static std::string build_pool() {
     return o;
 }
 
-static void save_pool(const std::string &p) {
-    if (!g_dir[0]) return;
-    char path[600];
-    snprintf(path, sizeof(path), "%s/files/jcc_cardpool.txt", g_dir);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        fwrite(p.data(), 1, p.size(), f);
-        fputc('\n', f);
-        fflush(f);
-        fclose(f);
-    }
+static void save_pool(const std::string & /*p*/) {
+    // 禁止往金铲铲 files/ 写任何文件（用户反馈污染+无意义）
 }
 
 static bool scan_heroes() {
@@ -1320,22 +1311,59 @@ static void *server(void *) {
     return nullptr;
 }
 
+// 加载页/进局资源阶段禁止重操作：只在「对局模型稳定」后才扫表/读局
+static bool battle_stable() {
+    Il2CppClass *cbm = nullptr;
+    auto battle = get_battle(&cbm);
+    if (!battle) return false;
+    auto pm = get_my_pm(battle, cbm);
+    if (!pm) return false;
+    int myId = get_my_id(battle, cbm);
+    return pid_ok(myId);
+}
+
 static void *worker(void *) {
+    // 再等 15s：错开「匹配成功→加载资源」；期间只挂着 TCP，不碰游戏
+    JLOGI("worker cool-down 15s (avoid resource load race)");
+    sleep(15);
     ensure_il2cpp_thread();
-    JCKPT("worker_start_full");
-    for (int i = 0; i < 60; i++) {
+    JCKPT("worker_start_safe");
+
+    // 牌库扫描很重：只在冷却后扫一次，失败再慢重试
+    for (int i = 0; i < 20; i++) {
         if (scan_heroes()) break;
-        sleep(2);
+        sleep(5);
     }
+
     int tick = 0;
+    int stable_hits = 0;
     while (g_run.load()) {
-        sleep(2);
+        sleep(3);
         tick++;
         ensure_il2cpp_thread();
-        if (g_shop_show.load() || g_pool.empty()) {
-            if ((tick % 30) == 0) scan_heroes();
+
+        bool stable = battle_stable();
+        if (stable)
+            stable_hits++;
+        else {
+            stable_hits = 0;
+            // 不在局 / 加载中：清空覆盖层缓存，避免 UI 误判 inBattle
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_hex = "EMPTY";
+                g_pred = "EMPTY";
+                g_pos = "EMPTY";
+                g_warn = "EMPTY";
+            }
+            g_overlay_ready.store(false);
+            if ((tick % 10) == 0) JLOGI("hb loading_or_lobby (no heavy battle read)");
+            continue;
         }
-        // 顺序：先 pos/pred，再 hex（hex 依赖 pos 就绪才放行 inBattle）
+        // 连续 2 次稳定才读局内，避免加载页半初始化对象
+        if (stable_hits < 2) continue;
+
+        if (g_shop_show.load() && g_pool.empty() && (tick % 20) == 0) scan_heroes();
+
         refresh_positions();
         refresh_opponent();
         refresh_hex();
@@ -1343,54 +1371,32 @@ static void *worker(void *) {
         if ((tick % 3) == 0) refresh_owned();
         if (g_op_board.load() && (tick % 3) == 0) refresh_opponent_board();
         if (g_auto_buy.load()) try_auto_buy();
-        if ((tick % 10) == 0) {
-            std::string lineup, hex, pred, pos, warn;
-            size_t pool_sz = 0;
+
+        if ((tick % 8) == 0) {
+            std::string lineup, hex, pred;
             {
                 std::lock_guard<std::mutex> lk(g_mu);
-                if (!g_heroes.empty()) {
-                    g_pool = build_pool();
-                    save_pool(g_pool);
-                }
+                if (!g_heroes.empty()) g_pool = build_pool();
                 lineup = g_lineup_dbg;
                 hex = g_hex;
                 pred = g_pred;
-                warn = g_warn;
-                pool_sz = g_pool.size();
-                pos = g_pos.size() > 40 ? g_pos.substr(0, 40) : g_pos;
             }
-            char hb[360];
-            snprintf(hb, sizeof(hb),
-                     "hb hex=%s pred=%s pos=%s ready=%d lineup=%s auto=%d board=%d",
-                     hex.c_str(), pred.c_str(), pos.c_str(), g_overlay_ready.load() ? 1 : 0,
-                     lineup.c_str(), g_auto_buy.load() ? 1 : 0, g_op_board.load() ? 1 : 0);
-            slog(hb);
-            JLOGI("STATUS F1pool=%zu F3pred=%s F5warn_len=%zu ready=%d F2lineup=%s", pool_sz,
-                  pred.c_str(), warn.size(), g_overlay_ready.load() ? 1 : 0, lineup.c_str());
+            JLOGI("hb hex=%s pred=%s ready=%d lineup=%s auto=%d", hex.c_str(), pred.c_str(),
+                  g_overlay_ready.load() ? 1 : 0, lineup.c_str(), g_auto_buy.load() ? 1 : 0);
         }
     }
     return nullptr;
 }
 
-void cardpool_start(const char *game_data_dir) {
-    if (!game_data_dir) return;
-    strncpy(g_dir, game_data_dir, sizeof(g_dir) - 1);
-    JccFileLog::I().init(game_data_dir);
+void cardpool_start(const char * /*game_data_dir*/) {
+    // 不写游戏 data 目录；日志在 jcc_log.init 已定
+    JccFileLog::I().init(nullptr);
     g_run.store(true);
-    JCKPT("full_kernel_1_0_0_start");
-    JLOGI("LOG_PATHS game/files/jcc_full.log + /sdcard/Download/jcc-scan/jcc_full.log");
-    JLOGI("LOG_ERR jcc_last_error.txt + jcc_errors.log (same dirs)");
-    JLOGI("LOG_PULL adb pull /sdcard/Download/jcc-scan/");
-    slog("FULL_KERNEL_" JCC_SEASON_TAG " overlay-safe no-UnityScreen " JCC_SEASON_SCAN_DATE);
+    g_dir[0] = 0;
+    JLOGI("FULL_KERNEL_%s log_only=%s (no game files)", JCC_SEASON_TAG, JccFileLog::I().path());
+    slog("FULL_KERNEL_" JCC_SEASON_TAG " safe-load-delay no-game-dir-writes");
 
-    if (il2cpp_domain_get && il2cpp_thread_attach) {
-        auto d = il2cpp_domain_get();
-        if (d) {
-            il2cpp_thread_attach(d);
-            slog("il2cpp_thread_attach ok");
-        }
-    }
-
+    // 只起 TCP；attach 放到 worker 冷却后
     pthread_t t1, t2;
     pthread_create(&t1, nullptr, server, nullptr);
     pthread_detach(t1);
