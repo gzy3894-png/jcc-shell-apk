@@ -1332,25 +1332,52 @@ static void *server(void *) {
     return nullptr;
 }
 
-// 加载页/进局资源阶段禁止重操作：只在「对局模型稳定」后才扫表/读局
-static bool battle_stable() {
+// 进局判定：写明失败原因，便于 log.txt 对照
+// 返回 0=ok，否则错误码
+static int battle_probe(char *why, size_t why_n) {
+    if (why && why_n) why[0] = 0;
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
-    if (!battle) return false;
+    if (!cbm) {
+        if (why) snprintf(why, why_n, "no_ChessBattleModel_class");
+        return 1;
+    }
+    if (!battle) {
+        if (why) snprintf(why, why_n, "no_battle_instance");
+        return 2;
+    }
     auto pm = get_my_pm(battle, cbm);
-    if (!pm) return false;
+    if (!pm) {
+        if (why) snprintf(why, why_n, "no_GetMyPlayerModel");
+        return 3;
+    }
     int myId = get_my_id(battle, cbm);
-    return pid_ok(myId);
+    if (!pid_ok(myId)) {
+        // 尝试从 PM 字段直接读
+        int pid = *(int *)((char *)pm + JCC_PM_PID);
+        if (pid_ok(pid)) {
+            if (why) snprintf(why, why_n, "ok_via_pm_field id=%d", pid);
+            return 0;
+        }
+        if (why) snprintf(why, why_n, "bad_myId=%d", myId);
+        return 4;
+    }
+    if (why) snprintf(why, why_n, "ok id=%d", myId);
+    return 0;
+}
+
+static bool battle_stable() {
+    char why[96];
+    return battle_probe(why, sizeof(why)) == 0;
 }
 
 static void *worker(void *) {
-    // 再等 15s：错开「匹配成功→加载资源」；期间只挂着 TCP，不碰游戏
-    JLOGI("worker cool-down 15s (avoid resource load race)");
-    sleep(15);
+    // 冷却缩短：原版 hooks 已跑完，过长只会一直 lobby
+    JLOGI("worker cool-down 8s");
+    sleep(8);
     ensure_il2cpp_thread();
     JCKPT("worker_start_safe");
 
-    // 牌库扫描很重：只在冷却后扫一次，失败再慢重试
     for (int i = 0; i < 20; i++) {
         if (scan_heroes()) break;
         sleep(5);
@@ -1359,16 +1386,17 @@ static void *worker(void *) {
     int tick = 0;
     int stable_hits = 0;
     while (g_run.load()) {
-        sleep(3);
+        sleep(2);
         tick++;
         ensure_il2cpp_thread();
 
-        bool stable = battle_stable();
+        char why[96];
+        int code = battle_probe(why, sizeof(why));
+        bool stable = (code == 0);
         if (stable)
             stable_hits++;
         else {
             stable_hits = 0;
-            // 不在局 / 加载中：清空覆盖层缓存，避免 UI 误判 inBattle
             {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_hex = "EMPTY";
@@ -1377,11 +1405,14 @@ static void *worker(void *) {
                 g_warn = "EMPTY";
             }
             g_overlay_ready.store(false);
-            if ((tick % 10) == 0) JLOGI("hb loading_or_lobby (no heavy battle read)");
+            // 每 15s 打一次原因（进对局后若仍失败好查）
+            if ((tick % 8) == 0)
+                JLOGI("hb lobby code=%d why=%s", code, why);
             continue;
         }
-        // 连续 2 次稳定才读局内，避免加载页半初始化对象
-        if (stable_hits < 2) continue;
+        // 连续 1 次即可（已在对局）
+        if (stable_hits < 1) continue;
+        if ((tick % 8) == 1) JLOGI("hb IN_BATTLE %s", why);
 
         if (g_shop_show.load() && g_pool.empty() && (tick % 20) == 0) scan_heroes();
 
