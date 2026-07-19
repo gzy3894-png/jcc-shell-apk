@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 #ifndef JCC_LOG_TAG
-#define JCC_LOG_TAG "v1.1.2"
+#define JCC_LOG_TAG "v1.1.4"
 #endif
 
 class JccFileLog {

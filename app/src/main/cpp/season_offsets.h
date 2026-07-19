@@ -1,7 +1,7 @@
 
 #pragma once
 
-#define JCC_SEASON_TAG "1.1.2"
+#define JCC_SEASON_TAG "1.1.4"
 #define JCC_SEASON_SCAN_DATE "2026-07-19"
 
 #define JCC_HERO_IID 0x10

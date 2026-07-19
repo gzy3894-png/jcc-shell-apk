@@ -47,8 +47,11 @@ static std::string g_warn = "EMPTY";
 static std::string g_pos = "EMPTY";
 static std::string g_pred = "EMPTY";
 static std::string g_opp_info = "EMPTY";
-static std::string g_board_push; 
+static std::string g_board_push;
 static std::string g_lineup_dbg = "none";
+static std::string g_shop_info = "EMPTY";
+
+static Il2CppObject *find_buy_hero_view();
 
 static std::atomic<bool> g_auto_buy{false};
 static std::atomic<bool> g_popup_block{false};
@@ -377,15 +380,22 @@ static bool scan_heroes() {
     auto m = meth(db, "SearchACGHero2", 1);
     if (!m) m = meth(db, "SearchACGHero", 1);
     if (!m) {
-        JERRF("F1", "SearchACGHero_missing"); slog("FAIL SearchACGHero*");
+        JERRF("F1", "SearchACGHero_missing");
+        slog("FAIL SearchACGHero*");
         return false;
     }
     auto inst = singleton(db);
     if (!inst) {
-        JERRF("F1", "db_instance_null"); slog("FAIL db instance");
+        JERRF("F1", "db_instance_null");
+        slog("FAIL db instance");
         return false;
     }
-    std::vector<Hero> rows;
+    struct Raw {
+        int id, cost, setn;
+        std::string name, icon;
+    };
+    std::vector<Raw> raw;
+    int maxSet = 0;
     for (int id = 1; id <= MAX_ID; id++) {
         int32_t hid = id;
         void *params[1] = {&hid};
@@ -394,35 +404,56 @@ static bool scan_heroes() {
         char *b = (char *)hero;
         int iid = *(int *)(b + JCC_HERO_IID);
         int cost = *(int *)(b + JCC_HERO_ICOST);
+        int setn = *(int *)(b + JCC_HERO_SETNUM);
         auto *ns = *(Il2CppString **)(b + JCC_HERO_SNAME);
         auto *ic = *(Il2CppString **)(b + JCC_HERO_PAINT_SMALL);
         if (iid <= 0) iid = id;
         if (cost < 1 || cost > 5) continue;
         std::string name = istr(ns);
         if (name.empty()) continue;
+        if (setn > maxSet && setn < 100) maxSet = setn;
         std::string icon = istr(ic);
         scrub(name);
         scrub(icon);
-        Hero h{};
-        h.id = iid;
-        h.cost = cost;
-        h.total = tier_total(cost);
-        h.name = name;
-        h.icon = icon;
-        rows.push_back(h);
+        raw.push_back({iid, cost, setn, name, icon});
     }
-    if (rows.empty()) {
+    if (raw.empty()) {
         slog("FAIL no heroes");
         return false;
+    }
+    // keep current set only (max setNum)
+    int keepSet = maxSet;
+    std::vector<Hero> rows;
+    for (auto &r : raw) {
+        if (keepSet > 0 && r.setn > 0 && r.setn != keepSet) continue;
+        Hero h{};
+        h.id = r.id;
+        h.cost = r.cost;
+        h.total = tier_total(r.cost);
+        h.name = r.name;
+        h.icon = r.icon;
+        rows.push_back(h);
+    }
+    if (rows.size() < 20) {
+        // fallback: all cost-valid
+        rows.clear();
+        for (auto &r : raw) {
+            Hero h{};
+            h.id = r.id;
+            h.cost = r.cost;
+            h.total = tier_total(r.cost);
+            h.name = r.name;
+            h.icon = r.icon;
+            rows.push_back(h);
+        }
     }
     {
         std::lock_guard<std::mutex> lk(g_mu);
         g_heroes.swap(rows);
         g_pool = build_pool();
     }
-    save_pool(g_pool);
-    char msg[80];
-    snprintf(msg, sizeof(msg), "scan_heroes ok n=%zu", g_heroes.size());
+    char msg[96];
+    snprintf(msg, sizeof(msg), "scan_heroes ok n=%zu set=%d", g_heroes.size(), keepSet);
     slog(msg);
     JCKPT("scan_heroes_ok");
     return true;
@@ -475,15 +506,27 @@ static void read_ha_ids(Il2CppObject *list, int *out, int maxn, int *n_out) {
     }
 }
 
-static void refresh_hex() {
-    
-    
+// PM: battle GetMyPlayerModel OR BuyHeroView._curPlayerModel
+static Il2CppObject *get_pm_any(Il2CppClass **cbm_out) {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
-    auto pm = battle ? get_my_pm(battle, cbm) : nullptr;
-    int myId = battle ? get_my_id(battle, cbm) : -1;
-    if (!battle || !pm || !pid_ok(myId)) {
-        g_overlay_ready.store(false);
+    if (cbm_out) *cbm_out = cbm;
+    if (battle && cbm) {
+        auto pm = get_my_pm(battle, cbm);
+        if (pm) return pm;
+    }
+    auto view = find_buy_hero_view();
+    if (view) {
+        auto *pm = *(Il2CppObject **)((char *)view + JCC_BH_CUR_PM);
+        if (pm) return pm;
+    }
+    return nullptr;
+}
+
+static void refresh_hex() {
+    Il2CppClass *cbm = nullptr;
+    auto pm = get_pm_any(&cbm);
+    if (!pm) {
         std::lock_guard<std::mutex> lk(g_mu);
         g_hex = "EMPTY";
         return;
@@ -503,25 +546,12 @@ static void refresh_hex() {
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%d,%d,%d", q[0], q[1], q[2]);
-
-    
-    bool pos_ok = false;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        pos_ok = !g_pos.empty() && g_pos != "EMPTY" && g_pos.find('x') != std::string::npos;
-        if (pos_ok) {
-            g_hex = buf;
-            g_overlay_ready.store(true);
-        } else {
-            g_hex = "EMPTY";
-            g_overlay_ready.store(false);
-        }
+        g_hex = buf;
+        g_overlay_ready.store(true);
     }
-    if (pos_ok) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "hex q=%s n=%d ready=1", buf, n);
-        JLOGI("%s", msg);
-    }
+    JLOGI("hex q=%s n=%d", buf, n);
 }
 
 static void foreach_unit_list(Il2CppObject *list,
@@ -1080,6 +1110,40 @@ static int read_shop_slots(Il2CppObject **slots_out, int *ids_out, int maxn) {
     return n;
 }
 
+static void refresh_shop_info() {
+    Il2CppObject *slots[5]{};
+    int ids[5]{};
+    int n = read_shop_slots(slots, ids, 5);
+    if (n <= 0) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_shop_info = "EMPTY";
+        return;
+    }
+    std::string out;
+    for (int i = 0; i < n; i++) {
+        int id = ids[i];
+        std::string name = "?";
+        int cost = 1;
+        for (auto &h : g_heroes) {
+            if (h.id == id) {
+                name = h.name;
+                cost = h.cost;
+                break;
+            }
+        }
+        scrub(name);
+        char b[160];
+        snprintf(b, sizeof(b), "%d:%s:%d", id, name.c_str(), cost);
+        if (!out.empty()) out.push_back('|');
+        out.append(b);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_shop_info = out;
+    }
+    JLOGI("shop n=%d %s", n, out.c_str());
+}
+
 static void try_auto_buy() {
     if (!g_auto_buy.load()) return;
     static int cool;
@@ -1224,6 +1288,7 @@ static std::string handle(const char *req) {
         if (strstr(p, "三星预警")) return "RSP:" + g_warn + "\n";
         if (strstr(p, "头像位置")) return "RSP:" + g_pos + "\n";
         if (strstr(p, "对手预测")) return "RSP:" + g_pred + "\n";
+        if (strstr(p, "商店信息")) return "RSP:" + g_shop_info + "\n";
         if (strstr(p, "版本") || strstr(p, "内核"))
             return std::string("RSP:") + JCC_SEASON_TAG + "\n";
         if (strstr(p, "转区状态")) return "RSP:OFF\n";
@@ -1296,44 +1361,32 @@ static void *server(void *) {
 
 static int battle_probe(char *why, size_t why_n) {
     if (why && why_n) why[0] = 0;
-    Il2CppClass *cbm = find_class("ZGameChess", "ChessBattleModel");
-    if (!cbm) cbm = find_class("", "ChessBattleModel");
-    if (!cbm) {
-        if (why) snprintf(why, why_n, "no_class");
-        return 1;
+    if (find_buy_hero_view()) {
+        if (why) snprintf(why, why_n, "ok_shop");
+        return 0;
     }
-    Il2CppObject *battle = nullptr;
-    Il2CppClass *cmm = find_class("ZGameChess", "ChessModelManager");
-    if (!cmm) cmm = find_class("", "ChessModelManager");
-    if (cmm) {
-        auto inst = singleton(cmm);
-        auto m = meth(cmm, "GetBattleModel", 0);
-        if (inst && m) battle = inv(m, inst, nullptr);
+    Il2CppClass *cbm = nullptr;
+    auto pm = get_pm_any(&cbm);
+    if (pm) {
+        int pid = *(int *)((char *)pm + JCC_PM_PLAYER_ID);
+        if (why) snprintf(why, why_n, "ok_pm id=%d", pid);
+        return 0;
     }
-    if (!battle) battle = singleton(cbm);
-    if (!battle) {
-        if (why) snprintf(why, why_n, "no_battle");
-        return 2;
+    auto battle = get_battle(&cbm);
+    if (!battle || !cbm) {
+        if (why) snprintf(why, why_n, "lobby");
+        return 3;
     }
-
-    
-    auto mMyId = meth(cbm, "GetMyPlayerId", 0);
-    int myId = -1;
-    if (mMyId) {
-        myId = unbox_i32(inv(mMyId, battle, nullptr));
+    auto mIn = meth(cbm, "IsInBattle", 0);
+    if (mIn) {
+        auto r = inv(mIn, battle, nullptr);
+        if (r && unbox_bool(r)) {
+            if (why) snprintf(why, why_n, "ok_IsInBattle");
+            return 0;
+        }
     }
-    if (!pid_ok(myId)) {
-        if (why) snprintf(why, why_n, "not_in_match myId=%d", myId);
-        return 3; 
-    }
-
-    auto pm = get_my_pm(battle, cbm);
-    if (!pm) {
-        if (why) snprintf(why, why_n, "no_pm id=%d", myId);
-        return 4;
-    }
-    if (why) snprintf(why, why_n, "ok id=%d", myId);
-    return 0;
+    if (why) snprintf(why, why_n, "lobby");
+    return 3;
 }
 
 static bool battle_stable() {
@@ -1342,9 +1395,8 @@ static bool battle_stable() {
 }
 
 static void *worker(void *) {
-    
-    JLOGI("worker cool-down 10s (matchmaking safe)");
-    sleep(10);
+    JLOGI("worker cool-down 8s");
+    sleep(8);
     ensure_il2cpp_thread();
     JCKPT("worker_start_safe");
 
@@ -1354,57 +1406,45 @@ static void *worker(void *) {
     }
 
     int tick = 0;
-    int stable_hits = 0;
     while (g_run.load()) {
-        sleep(3); 
+        sleep(2);
         tick++;
         ensure_il2cpp_thread();
 
         char why[96];
         int code = battle_probe(why, sizeof(why));
-        bool stable = (code == 0);
-        if (stable)
-            stable_hits++;
-        else {
-            stable_hits = 0;
+        if (code != 0) {
             {
                 std::lock_guard<std::mutex> lk(g_mu);
                 g_hex = "EMPTY";
                 g_pred = "EMPTY";
                 g_pos = "EMPTY";
                 g_warn = "EMPTY";
+                g_shop_info = "EMPTY";
             }
             g_overlay_ready.store(false);
             if ((tick % 5) == 0) JLOGI("hb lobby code=%d why=%s", code, why);
+            if (g_auto_buy.load()) try_auto_buy();
             continue;
         }
-        if (stable_hits < 2) {
-            if (stable_hits == 1) JLOGI("hb almost_battle %s", why);
-            continue;
-        }
-        if ((tick % 5) == 1) JLOGI("hb IN_BATTLE %s", why);
+        if ((tick % 5) == 1) JLOGI("hb IN_MATCH %s", why);
 
-        if (g_shop_show.load() && g_pool.empty() && (tick % 20) == 0) scan_heroes();
+        if (g_pool.empty() || (tick % 30) == 0) scan_heroes();
 
+        refresh_shop_info();
         refresh_positions();
         refresh_opponent();
         refresh_hex();
-        if ((tick % 2) == 0) refresh_warning();
-        if ((tick % 3) == 0) refresh_owned();
-        if (g_op_board.load() && (tick % 3) == 0) refresh_opponent_board();
+        refresh_warning();
+        refresh_owned();
+        if (g_op_board.load()) refresh_opponent_board();
         if (g_auto_buy.load()) try_auto_buy();
 
-        if ((tick % 8) == 0) {
-            std::string lineup, hex, pred;
-            {
-                std::lock_guard<std::mutex> lk(g_mu);
-                if (!g_heroes.empty()) g_pool = build_pool();
-                lineup = g_lineup_dbg;
-                hex = g_hex;
-                pred = g_pred;
-            }
-            JLOGI("hb hex=%s pred=%s ready=%d lineup=%s auto=%d", hex.c_str(), pred.c_str(),
-                  g_overlay_ready.load() ? 1 : 0, lineup.c_str(), g_auto_buy.load() ? 1 : 0);
+        if ((tick % 5) == 0) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (!g_heroes.empty()) g_pool = build_pool();
+            JLOGI("hb hex=%s pred=%s shop=%s auto=%d pool=%zu", g_hex.c_str(), g_pred.c_str(),
+                  g_shop_info.c_str(), g_auto_buy.load() ? 1 : 0, g_pool.size());
         }
     }
     return nullptr;

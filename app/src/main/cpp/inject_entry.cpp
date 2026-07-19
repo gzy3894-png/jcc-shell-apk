@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 static void *boot_thread(void *) {
-    JLOGI("boot_thread v1.1.2 path=%s", JccFileLog::I().path());
+    JLOGI("boot_thread v1.1.4 path=%s", JccFileLog::I().path());
 
     
     cardpool_start_server_only();
@@ -25,7 +25,7 @@ static void *boot_thread(void *) {
             il2cpp_api_init(handle);
             sleep(8); 
             cardpool_start_worker();
-            JLOGI("worker_started v1.1.2");
+            JLOGI("worker_started v1.1.4");
             return nullptr;
         }
         if ((i % 10) == 0) JLOGI("wait_il2cpp %d", i);
