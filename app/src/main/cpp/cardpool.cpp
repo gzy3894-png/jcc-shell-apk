@@ -398,25 +398,97 @@ static void refresh_hex() {
     JLOGI("%s", msg);
 }
 
-// ---- 自动拿牌：内存 ReqBuyHero（argc=0 on HeroRoot）----
+// ---- 商店槽：复刻原 SO 0x7d7a4 读法（百分百对照）----
+// BuyHeroView._listHeroRoot @ 0x148
+// List: items @ +0x10, size @ +0x18; elements @ items+0x20 + i*8
+// HeroRoot._dataId @ 0x1b0, Index @ 0x160
+static constexpr size_t BH_LIST = 0x148;
+static constexpr size_t BH_CUR_PM = 0x168;
+static constexpr size_t LIST_ITEMS = 0x10;
+static constexpr size_t LIST_SIZE = 0x18;
+static constexpr size_t ARR_BASE = 0x20; // first element
+static constexpr size_t HR_DATA_ID = 0x1b0;
+static constexpr size_t HR_INDEX = 0x160;
+
+static Il2CppObject *find_buy_hero_view() {
+    Il2CppClass *bv = find_class("ZGameChess", "BuyHeroView");
+    if (!bv) bv = find_class("", "BuyHeroView");
+    if (!bv) return nullptr;
+    // 尝试 get_Instance
+    auto inst = singleton(bv);
+    if (inst) return inst;
+    // Object.FindObjectOfType(Type)
+    Il2CppClass *obj = find_class("UnityEngine", "Object");
+    if (!obj || !il2cpp_class_get_type || !il2cpp_type_get_object) return nullptr;
+    auto m = meth(obj, "FindObjectOfType", 1);
+    if (!m) return nullptr;
+    auto typeObj = il2cpp_type_get_object(il2cpp_class_get_type(bv));
+    if (!typeObj) return nullptr;
+    void *params[1] = {typeObj};
+    return inv(m, nullptr, params);
+}
+
+// 返回当前商店 5 槽 HeroRoot* 与 dataId
+static int read_shop_slots(Il2CppObject **slots_out, int *ids_out, int maxn) {
+    auto view = find_buy_hero_view();
+    if (!view) {
+        JLOGI("shop: BuyHeroView null");
+        return 0;
+    }
+    char *vb = (char *)view;
+    auto *list = *(Il2CppObject **)(vb + BH_LIST);
+    if (!list) {
+        JLOGI("shop: _listHeroRoot null");
+        return 0;
+    }
+    char *lb = (char *)list;
+    auto *items = *(void **)(lb + LIST_ITEMS);
+    int size = *(int *)(lb + LIST_SIZE);
+    if (!items || size <= 0) {
+        JLOGI("shop: list empty size=%d", size);
+        return 0;
+    }
+    if (size > maxn) size = maxn;
+    if (size > 5) size = 5;
+    int n = 0;
+    char *arr = (char *)items;
+    for (int i = 0; i < size; i++) {
+        auto *hr = *(Il2CppObject **)(arr + ARR_BASE + i * (int)sizeof(void *));
+        if (!hr) continue;
+        int dataId = *(int *)((char *)hr + HR_DATA_ID);
+        slots_out[n] = hr;
+        ids_out[n] = dataId;
+        n++;
+        JLOGI("shop slot[%d] hr=%p dataId=%d", i, (void *)hr, dataId);
+    }
+    return n;
+}
+
+// ---- 自动拿牌：对商店槽 HeroRoot 调 ReqBuyHero（原 SO 同符号）----
 static void try_auto_buy() {
     if (!g_auto_buy.load()) return;
-    // 安全策略：仅当商店显示开启且能找到 HeroRoot 实例时调用；
-    // 无槽位列表时不盲目连点，只每 30s 记一次状态
-    static int n;
-    if ((++n % 15) != 0) return;
-    Il2CppClass *hr = find_class("ZGameChess", "HeroRoot");
-    if (!hr) {
-        slog("auto_buy: HeroRoot missing");
-        return;
-    }
-    auto m = meth(hr, "ReqBuyHero", 0);
-    if (!m) {
+    static int cool;
+    if ((++cool % 5) != 0) return; // ~10s if worker 2s
+    Il2CppClass *hrc = find_class("ZGameChess", "HeroRoot");
+    if (!hrc) return;
+    auto mBuy = meth(hrc, "ReqBuyHero", 0);
+    if (!mBuy) {
         slog("auto_buy: ReqBuyHero missing");
         return;
     }
-    // 无可靠实例来源时不 invoke，避免乱买
-    slog("auto_buy: armed (instance path pending stable shop slot read)");
+    Il2CppObject *slots[5]{};
+    int ids[5]{};
+    int n = read_shop_slots(slots, ids, 5);
+    if (n <= 0) return;
+    // 买第一格有效牌（与原 SO 筛费用逻辑不同，先保证内存购买通路）
+    for (int i = 0; i < n; i++) {
+        if (!slots[i] || ids[i] <= 0) continue;
+        inv(mBuy, slots[i], nullptr);
+        char msg[80];
+        snprintf(msg, sizeof(msg), "auto_buy invoke slot=%d dataId=%d", i, ids[i]);
+        slog(msg);
+        break; // 一次只买一张，防连爆
+    }
 }
 
 static std::string handle(const char *req) {
@@ -559,6 +631,19 @@ static void *worker(void *) {
         }
         refresh_opponent();
         refresh_hex();
+        // 周期读商店槽（原 SO 0x7d7a4 路径），供日志与自动买
+        if ((tick % 3) == 0) {
+            Il2CppObject *slots[5]{};
+            int ids[5]{};
+            int n = read_shop_slots(slots, ids, 5);
+            if (n > 0) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "shop_slots n=%d ids=%d,%d,%d,%d,%d", n, ids[0],
+                         n > 1 ? ids[1] : 0, n > 2 ? ids[2] : 0, n > 3 ? ids[3] : 0,
+                         n > 4 ? ids[4] : 0);
+                slog(msg);
+            }
+        }
         try_auto_buy();
         if ((tick % 10) == 0) {
             std::lock_guard<std::mutex> lk(g_mu);
