@@ -1,9 +1,10 @@
-/* JCC 2.5.1 — 当前赛季字段（机扫 2026-07-18） */
+/* JCC season fields — machine-scanned 2026-07-18 + dump/SO certified 2026-07-19 */
 #pragma once
 
-#define JCC_SEASON_TAG "2.5.1"
+#define JCC_SEASON_TAG "2.6.2"
 #define JCC_SEASON_SCAN_DATE "2026-07-18"
 
+/* TACG_Hero_Client (MATCH original SO 0x7e4bc) */
 #define JCC_HERO_IID 0x10
 #define JCC_HERO_SNAME 0x18
 #define JCC_HERO_ICOST 0x60
@@ -11,6 +12,55 @@
 #define JCC_HERO_SETNUM 0x114
 #define JCC_HERO_ISTAR 0x34
 #define JCC_HERO_IQUALITY 0x38
+
+/* PlayerModel (scan + dump MATCH) */
+#define JCC_PM_BATTLE_TURN 0x20
+#define JCC_PM_HEX_AUGMENT 0x28
+#define JCC_PM_MONEY 0x5c
+#define JCC_PM_LAST_ENEMY 0x64
+#define JCC_PM_HP 0xbc
+#define JCC_PM_BUY_HERO_DICT 0x108
+#define JCC_PM_HA_STORE_S6 0x128
+#define JCC_PM_ACTIVE_HA_IDS 0x148
+#define JCC_PM_HA_CONFIG_IDS 0x150
+#define JCC_PM_ENEMY_PLAYER 0x1c0
+#define JCC_PM_PLAYER_ID 0x270
+#define JCC_PM_UNIT_DICT 0x278
+#define JCC_PM_WAIT_UNITS 0x388
+#define JCC_PM_BATTLE_UNITS 0x390
+
+/* UnitData (scan MATCH — board without LoadBody) */
+#define JCC_UD_HERO_ID 0x14
+#define JCC_UD_PLAYER_ID 0x24
+#define JCC_UD_COL 0x30
+#define JCC_UD_ROW 0x34
+#define JCC_UD_TAB 0xe8
+#define JCC_UD_HERO_NAME 0x120
+#define JCC_UD_LEVEL 0x148
+#define JCC_UD_QUALITY 0x150
+
+/* BuyHeroView shop (SO 0x7d7a4 MATCH) */
+#define JCC_BH_LIST_HERO 0x148
+#define JCC_BH_CUR_PM 0x168
+#define JCC_HR_INDEX 0x160
+#define JCC_HR_DATA_ID 0x1b0
+
+/* TACG_HABasicConfig_Client */
+#define JCC_HA_IID 0x10
+#define JCC_HA_SNAME 0x18
+#define JCC_HA_ILEVEL 0x28
+
+/* PlayerListPanel / PlayerListItem */
+#define JCC_PLP_ITEM_LIST 0x120
+#define JCC_PLI_HEAD_GO 0x60
+#define JCC_PLI_ITEM_ID 0x194
+#define JCC_PLI_INDEX 0x1a0
+#define JCC_PLI_PLAYER_MODEL 0x1b8
+
+/* IL2CPP List / Array */
+#define JCC_LIST_ITEMS 0x10
+#define JCC_LIST_SIZE 0x18
+#define JCC_ARR_FIRST 0x20
 
 #define JCC_NS_HERO "ZGameClient"
 #define JCC_CLS_HERO "TACG_Hero_Client"
