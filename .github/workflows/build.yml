@@ -25,10 +25,8 @@ jobs:
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release-unsigned.apk dist/jcc-shell-unsigned.apk 2>/dev/null || true
           cp app/build/outputs/apk/release/*.apk dist/ || true
-          # debug if release missing
           ./gradlew :app:assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk dist/jcc-shell-v2.5.1.apk
-          # jcc_inject 可执行文件（真机无 Hook 注入）
           find app -name 'jcc_inject' -type f 2>/dev/null | head -20
           INJ=$(find app -name 'jcc_inject' -type f 2>/dev/null | head -1)
           if [ -n "$INJ" ]; then cp -f "$INJ" dist/jcc_inject; chmod +x dist/jcc_inject; ls -la dist/jcc_inject; fi
@@ -40,29 +38,3 @@ jobs:
           path: |
             dist/*.apk
             dist/jcc_inject
-      - name: Release 2.5.1
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v2.5.1
-          name: JCC Shell 2.5.1（当前赛季数据）
-          body: |
-            ## 这是什么
-            在 2.5.0 思路上，换入 **2026-07 真机扫描** 的当前赛季字段，做牌库读取。
-
-            ## 你怎么用
-            1. 安装 APK（需 Root）
-            2. 点启动注入（会拉起金铲铲）
-            3. 进大厅后点刷新牌库，或读  
-               `/data/user/0/com.tencent.jkchess/files/jcc_cardpool.txt`
-            4. 协议仍是 `127.0.0.1:31338` 的 `GET:牌库`
-
-            ## 和 2.5.0 的关系
-            - 注入/通信方式沿用
-            - **游戏内字段数据已更新为 2.5.1 赛季**
-            - 剩余张数等高级功能仍在迭代
-          files: dist/jcc-shell-v2.5.1.apk
-          generate_release_notes: false
-          fail_on_unmatched_files: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true

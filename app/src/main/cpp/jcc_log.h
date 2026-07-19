@@ -1,6 +1,5 @@
 #pragma once
-// 与原版 libJCC 同一文件：files/log.txt（用户已确认只有这个）
-// 每行带 [FULL-x.y.z] 标记，方便和原版日志区分
+
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -21,10 +20,10 @@ public:
         return inst;
     }
 
-    void init(const char * /*ignored*/) {
+    void init(const char * ) {
         std::lock_guard<std::mutex> lk(mu_);
         if (inited_) return;
-        // 原版路径优先（用户机器上只有 log.txt）
+        
         const char *cands[] = {
             "/data/user/0/com.tencent.jkchess/files/log.txt",
             "/data/data/com.tencent.jkchess/files/log.txt",
@@ -56,7 +55,7 @@ public:
             try_write(path_.c_str(), line);
             return;
         }
-        // 再试一遍
+        
         const char *cands[] = {
             "/data/user/0/com.tencent.jkchess/files/log.txt",
             "/data/data/com.tencent.jkchess/files/log.txt",

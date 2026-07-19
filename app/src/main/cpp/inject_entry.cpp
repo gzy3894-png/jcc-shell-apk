@@ -1,7 +1,5 @@
-// dlopen 进游戏后自动跑
-// 1) 构造函数立刻写 jcc.log（证明注入成功）
-// 2) 立刻起 31338（Controller 能连上）
-// 3) 延后碰 il2cpp / 业务，避免加载页资源错误
+
+
 #include "cardpool.h"
 #include "il2cpp_dump.h"
 #include "jcc_log.h"
@@ -14,10 +12,10 @@
 static void *boot_thread(void *) {
     JLOGI("boot_thread v1.1.2 path=%s", JccFileLog::I().path());
 
-    // TCP 先起：不依赖 il2cpp，Controller 连上就能看到版本日志
+    
     cardpool_start_server_only();
 
-    // 等加载高峰过后再碰 libil2cpp
+    
     sleep(12);
 
     for (int i = 0; i < 150; i++) {
@@ -25,7 +23,7 @@ static void *boot_thread(void *) {
         if (handle) {
             JLOGI("libil2cpp +%ds", i + 12);
             il2cpp_api_init(handle);
-            sleep(8); // 再错开进局资源加载
+            sleep(8); 
             cardpool_start_worker();
             JLOGI("worker_started v1.1.2");
             return nullptr;
@@ -38,7 +36,7 @@ static void *boot_thread(void *) {
 }
 
 __attribute__((constructor)) static void on_load() {
-    // 与原版同一 log.txt，一行 [FULL-1.0.5] BOOT
+    
     JccFileLog::I().init(nullptr);
     JLOGI("BOOT so_loaded log=%s", JccFileLog::I().path());
 

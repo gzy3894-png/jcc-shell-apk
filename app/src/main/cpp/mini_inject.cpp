@@ -1,5 +1,5 @@
-// jcc_inject: ptrace remote dlopen — 只加载 SO，不装任何游戏 Hook
-// usage: jcc_inject <pid> <absolute_so_path>
+
+
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
@@ -81,11 +81,11 @@ static uint64_t remote_sym(pid_t pid, void *local_fn, const char *mod_hint) {
     const char *name = info.dli_fname ? strrchr(info.dli_fname, '/') : nullptr;
     name = name ? name + 1 : info.dli_fname;
     if (name && maps_base(pid, name, &base)) return base + off;
-    // try common
+    
     const char *cands[] = {"libdl.so", "linker64", "libc.so", nullptr};
     for (int i = 0; cands[i]; i++) {
         if (maps_base(pid, cands[i], &base)) {
-            // only valid if same module family - try libdl first for dlopen
+            
             if (strstr(cands[i], "dl") || strstr(cands[i], "linker")) return base + off;
         }
     }
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
     uint64_t sp = (reg.sp - 0x200) & ~0xFULL;
     poke(pid, sp, so, sl);
 
-    // x0 = path, x1 = RTLD_NOW (2), lr = 0, pc = dlopen
+    
     reg.regs[0] = sp;
     reg.regs[1] = 2;
     reg.regs[30] = 0;
