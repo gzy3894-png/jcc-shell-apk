@@ -27,9 +27,14 @@ jobs:
           cp app/build/outputs/apk/release/*.apk dist/ || true
           ./gradlew :app:assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk dist/jcc-shell-v2.5.1.apk
-          find app -name 'jcc_inject' -type f 2>/dev/null | head -20
-          INJ=$(find app -name 'jcc_inject' -type f 2>/dev/null | head -1)
-          if [ -n "$INJ" ]; then cp -f "$INJ" dist/jcc_inject; chmod +x dist/jcc_inject; ls -la dist/jcc_inject; fi
+          find app -type f -name 'jcc_inject' 2>/dev/null | head -40
+          INJ=$(find app -type f -name 'jcc_inject' 2>/dev/null | grep arm64 | head -1)
+          if [ -z "$INJ" ]; then INJ=$(find app -type f -name 'jcc_inject' 2>/dev/null | head -1); fi
+          if [ -z "$INJ" ]; then echo "jcc_inject missing"; exit 1; fi
+          cp -f "$INJ" dist/jcc_inject
+          chmod +x dist/jcc_inject
+          file dist/jcc_inject || true
+          python3 -c "import struct;b=open('dist/jcc_inject','rb').read(20);m=struct.unpack_from('<H',b,18)[0];print('e_machine',m);import sys;sys.exit(0 if m==183 else 1)"
           ls -la dist/
           unzip -l dist/jcc-shell-v2.5.1.apk | grep -E 'libJCC|lib/' || true
       - uses: actions/upload-artifact@v4
