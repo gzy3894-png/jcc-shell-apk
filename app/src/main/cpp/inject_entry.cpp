@@ -1,5 +1,7 @@
-// 被 JCC.sh / ptrace dlopen 进游戏进程后自动跑
-// 注意：加载阶段禁止狂扫 IL2CPP，否则易「资源错误」
+// dlopen 进游戏后自动跑
+// 1) 构造函数立刻写 jcc.log（证明注入成功）
+// 2) 立刻起 31338（Controller 能连上）
+// 3) 延后碰 il2cpp / 业务，避免加载页资源错误
 #include "cardpool.h"
 #include "il2cpp_dump.h"
 #include "jcc_log.h"
@@ -10,32 +12,36 @@
 #include <unistd.h>
 
 static void *boot_thread(void *) {
-    // 日志只写 Download/jcc-scan/jcc.log（不写游戏目录）
-    JccFileLog::I().init(nullptr);
-    JLOGI("inject_boot path=%s", JccFileLog::I().path());
+    JLOGI("boot_thread full-1.0.3 path=%s", JccFileLog::I().path());
 
-    // 等游戏完成基础加载，再碰 libil2cpp（避免进局加载页资源错误）
-    sleep(8);
+    // TCP 先起：不依赖 il2cpp，Controller 连上就能看到版本日志
+    cardpool_start_server_only();
 
-    for (int i = 0; i < 120; i++) {
+    // 等加载高峰过后再碰 libil2cpp
+    sleep(12);
+
+    for (int i = 0; i < 150; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            JLOGI("libil2cpp ready +%ds", i + 8);
+            JLOGI("libil2cpp +%ds", i + 12);
             il2cpp_api_init(handle);
-            // 再等一会儿再起业务线程，错开「匹配成功→加载资源」高峰
-            sleep(5);
-            cardpool_start(nullptr);
+            sleep(8); // 再错开进局资源加载
+            cardpool_start_worker();
+            JLOGI("worker_started full-1.0.3");
             return nullptr;
         }
-        if (i % 15 == 0) JLOGI("wait il2cpp %d", i);
+        if ((i % 10) == 0) JLOGI("wait_il2cpp %d", i);
         sleep(1);
     }
-    JLOGE("FAIL libil2cpp not found");
+    JLOGE("FAIL libil2cpp timeout — inject ok but game runtime not ready");
     return nullptr;
 }
 
 __attribute__((constructor)) static void on_load() {
-    // constructor 里只起线程，不做任何游戏调用、不写游戏目录
+    // 最早、最硬：只要 so 被加载，就必须留下字
+    JccFileLog::I().init(nullptr);
+    JLOGI("BOOT full-1.0.3 so_loaded path=%s", JccFileLog::I().path());
+
     pthread_t t;
     pthread_create(&t, nullptr, boot_thread, nullptr);
     pthread_detach(t);

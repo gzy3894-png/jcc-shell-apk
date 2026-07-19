@@ -1239,12 +1239,20 @@ static std::string handle(const char *req) {
             if (g_pool.empty()) return "RSP:\n";
             return "RSP:" + g_pool + "\n";
         }
-        if (strstr(p, "日志")) return "RSP:" + g_log + "\n";
+        if (strstr(p, "日志")) {
+            // 日志开头永远带版本，Controller「日志」页可确认注入
+            std::string ver = std::string("KERNEL=") + JCC_SEASON_TAG + " log=" +
+                              (JccFileLog::I().path() ? JccFileLog::I().path() : "?") + "\n";
+            return "RSP:" + ver + g_log + "\n";
+        }
         if (strstr(p, "海克斯品质")) return "RSP:" + g_hex + "\n";
         if (strstr(p, "三星预警")) return "RSP:" + g_warn + "\n";
         if (strstr(p, "头像位置")) return "RSP:" + g_pos + "\n";
         if (strstr(p, "对手预测")) return "RSP:" + g_pred + "\n";
-        if (strstr(p, "转区")) return "RSP:0\n";
+        if (strstr(p, "版本") || strstr(p, "内核"))
+            return std::string("RSP:") + JCC_SEASON_TAG + "\n";
+        if (strstr(p, "转区状态")) return "RSP:OFF\n";
+        if (strstr(p, "转区")) return "RSP:OK\n";
         return "RSP:EMPTY\n";
     }
     return "RSP:ERR\n";
@@ -1388,18 +1396,41 @@ static void *worker(void *) {
     return nullptr;
 }
 
-void cardpool_start(const char * /*game_data_dir*/) {
-    // 不写游戏 data 目录；日志在 jcc_log.init 已定
+static std::atomic<bool> g_server_up{false};
+static std::atomic<bool> g_worker_up{false};
+
+void cardpool_start_server_only() {
     JccFileLog::I().init(nullptr);
     g_run.store(true);
     g_dir[0] = 0;
-    JLOGI("FULL_KERNEL_%s log_only=%s (no game files)", JCC_SEASON_TAG, JccFileLog::I().path());
-    slog("FULL_KERNEL_" JCC_SEASON_TAG " safe-load-delay no-game-dir-writes");
-
-    // 只起 TCP；attach 放到 worker 冷却后
-    pthread_t t1, t2;
+    // 覆盖层安全默认：未就绪一律 EMPTY，开预测层不会进脏数据
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_hex = "EMPTY";
+        g_pred = "EMPTY";
+        g_pos = "EMPTY";
+        g_warn = "EMPTY";
+        g_log = std::string("KERNEL=") + JCC_SEASON_TAG + " server_only\n";
+    }
+    g_overlay_ready.store(false);
+    if (g_server_up.exchange(true)) return;
+    JLOGI("server_only %s log=%s", JCC_SEASON_TAG, JccFileLog::I().path());
+    slog("FULL_KERNEL_" JCC_SEASON_TAG " TCP up, worker later");
+    pthread_t t1;
     pthread_create(&t1, nullptr, server, nullptr);
     pthread_detach(t1);
+}
+
+void cardpool_start_worker() {
+    if (g_worker_up.exchange(true)) return;
+    if (!g_server_up.load()) cardpool_start_server_only();
+    JLOGI("start_worker %s", JCC_SEASON_TAG);
+    pthread_t t2;
     pthread_create(&t2, nullptr, worker, nullptr);
     pthread_detach(t2);
+}
+
+void cardpool_start(const char * /*game_data_dir*/) {
+    cardpool_start_server_only();
+    cardpool_start_worker();
 }

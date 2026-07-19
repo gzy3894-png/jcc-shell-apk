@@ -1,10 +1,12 @@
 #pragma once
-// 只写 1 个日志文件，禁止往金铲铲 data 目录塞文件
+// 游戏进程可写路径（Download 经常写不进，别用）
+// 只维护最多 2 个文件：files/jcc.log + /data/local/tmp/jcc.log
 #include <cstdio>
 #include <ctime>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 
 class JccFileLog {
 public:
@@ -13,22 +15,35 @@ public:
         return inst;
     }
 
-    // game_data_dir 忽略：绝不写游戏 files/
-    void init(const char * /*game_data_dir*/) {
+    void init(const char * /*ignored*/) {
         std::lock_guard<std::mutex> lk(mu_);
         if (inited_) return;
-        mkdir("/sdcard/Download/jcc-scan", 0777);
-        // 优先公共目录（用户可直接文件管理器看到）
-        path_ = "/sdcard/Download/jcc-scan/jcc.log";
-        FILE *t = fopen(path_.c_str(), "a");
-        if (!t) {
-            path_ = "/data/local/tmp/jcc.log";
-            t = fopen(path_.c_str(), "a");
-        }
-        if (t) {
-            fprintf(t, "\n==== %ld path=%s ====\n", (long)time(nullptr), path_.c_str());
-            fflush(t);
-            fclose(t);
+        // 候选：游戏 files（进程一定能写）+ tmp
+        const char *cands[] = {
+            "/data/user/0/com.tencent.jkchess/files/jcc.log",
+            "/data/data/com.tencent.jkchess/files/jcc.log",
+            "/data/local/tmp/jcc.log",
+            nullptr,
+        };
+        primary_.clear();
+        secondary_.clear();
+        for (int i = 0; cands[i]; i++) {
+            // 确保 files 目录存在
+            std::string p = cands[i];
+            auto slash = p.rfind('/');
+            if (slash != std::string::npos) {
+                std::string dir = p.substr(0, slash);
+                mkdir(dir.c_str(), 0777);
+            }
+            FILE *f = fopen(cands[i], "a");
+            if (!f) continue;
+            fprintf(f, "\n==== BOOT %ld pid=%d ====\n", (long)time(nullptr), (int)getpid());
+            fflush(f);
+            fclose(f);
+            if (primary_.empty())
+                primary_ = cands[i];
+            else if (secondary_.empty() && primary_ != cands[i])
+                secondary_ = cands[i];
         }
         inited_ = true;
     }
@@ -36,12 +51,11 @@ public:
     void log(const char *level, const char *msg) {
         std::lock_guard<std::mutex> lk(mu_);
         if (!inited_) init(nullptr);
-        if (path_.empty()) return;
-        FILE *f = fopen(path_.c_str(), "a");
-        if (!f) return;
-        fprintf(f, "[%ld][%s] %s\n", (long)time(nullptr), level ? level : "?", msg ? msg : "");
-        fflush(f);
-        fclose(f);
+        char line[900];
+        snprintf(line, sizeof(line), "[%ld][%s] %s\n", (long)time(nullptr), level ? level : "?",
+                 msg ? msg : "");
+        write_one(primary_.c_str(), line);
+        if (!secondary_.empty()) write_one(secondary_.c_str(), line);
     }
 
     void checkpoint(const char *name) {
@@ -50,12 +64,24 @@ public:
         log("C", b);
     }
 
-    const char *path() const { return path_.c_str(); }
+    const char *path() const {
+        return primary_.empty() ? "(no-writable-log-path)" : primary_.c_str();
+    }
 
 private:
     std::mutex mu_;
-    std::string path_;
+    std::string primary_;
+    std::string secondary_;
     bool inited_{false};
+
+    static void write_one(const char *path, const char *line) {
+        if (!path || !path[0] || !line) return;
+        FILE *f = fopen(path, "a");
+        if (!f) return;
+        fputs(line, f);
+        fflush(f);
+        fclose(f);
+    }
 };
 
 #define JLOGI(...)                                                                                 \
