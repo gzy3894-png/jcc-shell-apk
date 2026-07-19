@@ -1354,7 +1354,7 @@ static int battle_probe(char *why, size_t why_n) {
     int myId = get_my_id(battle, cbm);
     if (!pid_ok(myId)) {
         // 尝试从 PM 字段直接读
-        int pid = *(int *)((char *)pm + JCC_PM_PID);
+        int pid = *(int *)((char *)pm + JCC_PM_PLAYER_ID);
         if (pid_ok(pid)) {
             if (why) snprintf(why, why_n, "ok_via_pm_field id=%d", pid);
             return 0;
