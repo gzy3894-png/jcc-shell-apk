@@ -18,4 +18,8 @@ add_library(JCC SHARED
         xdl/xdl_util.c
 )
 
+# 真机极简注入：只 dlopen，不装原版资源/特效 Hook
+add_executable(jcc_inject mini_inject.cpp)
+
 target_link_libraries(JCC log)
+target_link_libraries(jcc_inject log dl)

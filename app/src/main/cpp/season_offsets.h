@@ -1,7 +1,7 @@
 /* JCC season fields — dump.cs + scan + 用户确认：自动买=阵容内存匹配 */
 #pragma once
 
-#define JCC_SEASON_TAG "1.1.1"
+#define JCC_SEASON_TAG "1.1.2"
 #define JCC_SEASON_SCAN_DATE "2026-07-19"
 /* branch jcc-full-kernel: dump-backed F1-F10 */
 

@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #ifndef JCC_LOG_TAG
-#define JCC_LOG_TAG "v1.1.1"
+#define JCC_LOG_TAG "v1.1.2"
 #endif
 
 class JccFileLog {

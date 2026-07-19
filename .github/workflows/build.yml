@@ -28,12 +28,18 @@ jobs:
           # debug if release missing
           ./gradlew :app:assembleDebug --no-daemon
           cp app/build/outputs/apk/debug/app-debug.apk dist/jcc-shell-v2.5.1.apk
+          # jcc_inject 可执行文件（真机无 Hook 注入）
+          find app -name 'jcc_inject' -type f 2>/dev/null | head -20
+          INJ=$(find app -name 'jcc_inject' -type f 2>/dev/null | head -1)
+          if [ -n "$INJ" ]; then cp -f "$INJ" dist/jcc_inject; chmod +x dist/jcc_inject; ls -la dist/jcc_inject; fi
           ls -la dist/
           unzip -l dist/jcc-shell-v2.5.1.apk | grep -E 'libJCC|lib/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: jcc-shell-apk-2.5.1
-          path: dist/*.apk
+          path: |
+            dist/*.apk
+            dist/jcc_inject
       - name: Release 2.5.1
         uses: softprops/action-gh-release@v2
         with:
