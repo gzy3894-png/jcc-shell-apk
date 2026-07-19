@@ -1,7 +1,7 @@
 /* JCC season fields — dump.cs + scan + 用户确认：自动买=阵容内存匹配 */
 #pragma once
 
-#define JCC_SEASON_TAG "2.6.3"
+#define JCC_SEASON_TAG "2.6.4"
 #define JCC_SEASON_SCAN_DATE "2026-07-19"
 
 /* TACG_Hero_Client (MATCH original SO 0x7e4bc) */

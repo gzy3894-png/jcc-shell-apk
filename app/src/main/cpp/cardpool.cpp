@@ -1,7 +1,6 @@
-// JCC 2.6.3 混合内核（不 hook 资源/加载）
-// - 自动买：读金铲铲自带阵容 TeamRecommend → 匹配商店 HeroRoot → ReqBuyHero（纯内存）
-// - 预测协议 battleState=4；海克斯无局 EMPTY（防覆盖层误入）
-// - 禁止 FindObjectOfType / 资源 Dobby
+// JCC 2.6.4 混合内核（不 hook 资源/加载）
+// - 自动买：TeamRecommend 阵容 HasHero / HeroAndEquipments.ContainsKey → ReqBuyHero（纯内存）
+// - 预测 battleState=4；海克斯无局 EMPTY；禁 FindObjectOfType
 #include "cardpool.h"
 #include "il2cpp-class.h"
 #include "jcc_log.h"
@@ -846,7 +845,20 @@ static Il2CppObject *get_stage_recommend_data() {
     return *(Il2CppObject **)((char *)model + JCC_TRM_CUR_STAGE_DATA);
 }
 
-// 当前应用阵容是否包含该英雄 conf id
+// TKDictionary / Dictionary.ContainsKey(int)
+static bool dict_contains_int(Il2CppObject *dict, int key) {
+    if (!dict || key <= 0 || !il2cpp_object_get_class) return false;
+    auto *klass = il2cpp_object_get_class(dict);
+    if (!klass) return false;
+    auto m = meth(klass, "ContainsKey", 1);
+    if (!m) return false;
+    int32_t a = key;
+    void *p[1] = {&a};
+    auto r = inv(m, dict, p);
+    return r ? unbox_bool(r) : false;
+}
+
+// 当前应用阵容是否包含该英雄 conf id（纯内存）
 static bool lineup_has_hero(Il2CppObject *stage, int heroId) {
     if (!stage || heroId <= 0) return false;
     Il2CppClass *sr = find_class("ZGameChess", "StageRecommendTeamData");
@@ -857,7 +869,7 @@ static bool lineup_has_hero(Il2CppObject *stage, int heroId) {
             int32_t a = heroId;
             void *p[1] = {&a};
             auto r = inv(m, stage, p);
-            if (r) return unbox_bool(r);
+            if (r && unbox_bool(r)) return true;
         }
         auto m2 = meth(sr, "IsCoreHero", 1);
         if (m2) {
@@ -866,8 +878,17 @@ static bool lineup_has_hero(Il2CppObject *stage, int heroId) {
             auto r = inv(m2, stage, p);
             if (r && unbox_bool(r)) return true;
         }
+        // GetHeroDataDic → ContainsKey
+        auto m3 = meth(sr, "GetHeroDataDic", 0);
+        if (m3) {
+            auto dic = inv(m3, stage, nullptr);
+            if (dic && dict_contains_int(dic, heroId)) return true;
+        }
     }
-    // fallback: CoreHeroId 字段
+    // HeroAndEquipments @0x10 直接 ContainsKey（阵容英雄表）
+    auto *he = *(Il2CppObject **)((char *)stage + JCC_SRTD_HERO_EQUIPS);
+    if (he && dict_contains_int(he, heroId)) return true;
+
     int core = *(int *)((char *)stage + JCC_SRTD_CORE_HERO);
     if (core == heroId) return true;
     return false;
@@ -1193,8 +1214,8 @@ void cardpool_start(const char *game_data_dir) {
     strncpy(g_dir, game_data_dir, sizeof(g_dir) - 1);
     JccFileLog::I().init(game_data_dir);
     g_run.store(true);
-    JCKPT("cardpool_start_2_6_3");
-    slog("hybrid_kernel_" JCC_SEASON_TAG " lineup-auto-buy " JCC_SEASON_SCAN_DATE);
+    JCKPT("cardpool_start_2_6_4");
+    slog("hybrid_kernel_" JCC_SEASON_TAG " lineup-HasHero+dict " JCC_SEASON_SCAN_DATE);
 
     if (il2cpp_domain_get && il2cpp_thread_attach) {
         auto d = il2cpp_domain_get();
