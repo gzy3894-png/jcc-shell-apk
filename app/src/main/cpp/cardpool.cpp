@@ -98,6 +98,21 @@ static void slog(const char *m) {
     JLOGI("%s", m);
 }
 
+// 节流：同一错误码每 N 次只打 1 次 ERR（首次必打）
+static void err_throttle(const char *feat, const char *code, int every, const char *detail) {
+    static std::mutex m;
+    static std::map<std::string, int> cnt;
+    std::string key = std::string(feat ? feat : "?") + ":" + (code ? code : "?");
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        n = ++cnt[key];
+    }
+    if (n == 1 || (every > 0 && (n % every) == 0)) {
+        JERRF(feat, "%s n=%d %s", code ? code : "?", n, detail ? detail : "");
+    }
+}
+
 static std::string u16(const Il2CppChar *p, int n) {
     std::string o;
     if (!p || n <= 0) return o;
@@ -372,18 +387,19 @@ static bool scan_heroes() {
     Il2CppClass *db = find_class("ZGame", "DataBaseManager");
     if (!db) db = find_class("", "DataBaseManager");
     if (!db) {
+        JERRF("F1", "DataBaseManager_missing");
         slog("FAIL DataBaseManager");
         return false;
     }
     auto m = meth(db, "SearchACGHero2", 1);
     if (!m) m = meth(db, "SearchACGHero", 1);
     if (!m) {
-        slog("FAIL SearchACGHero*");
+        JERRF("F1", "SearchACGHero_missing"); slog("FAIL SearchACGHero*");
         return false;
     }
     auto inst = singleton(db);
     if (!inst) {
-        slog("FAIL db instance");
+        JERRF("F1", "db_instance_null"); slog("FAIL db instance");
         return false;
     }
     std::vector<Hero> rows;
@@ -647,6 +663,7 @@ static void refresh_warning() {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
     if (!battle) {
+        err_throttle("F5", "no_battle", 30, "not in match");
         std::lock_guard<std::mutex> lk(g_mu);
         g_warn = "EMPTY";
         return;
@@ -655,6 +672,7 @@ static void refresh_warning() {
     std::vector<Il2CppObject *> pms;
     collect_all_pms(battle, cbm, pms);
     if (pms.empty()) {
+        err_throttle("F5", "no_players", 20, "collect_all_pms empty");
         std::lock_guard<std::mutex> lk(g_mu);
         g_warn = "EMPTY";
         return;
@@ -751,6 +769,7 @@ static void refresh_opponent() {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
     if (!battle) {
+        err_throttle("F3", "no_battle", 30, "predict");
         std::lock_guard<std::mutex> lk(g_mu);
         g_opp_info = "EMPTY";
         g_pred = "EMPTY";
@@ -758,6 +777,7 @@ static void refresh_opponent() {
     }
     int myId = get_my_id(battle, cbm);
     if (!pid_ok(myId)) {
+        err_throttle("F3", "bad_myId", 20, "get_MyPlayerId failed");
         std::lock_guard<std::mutex> lk(g_mu);
         g_pred = "EMPTY";
         return;
@@ -805,7 +825,8 @@ static void refresh_opponent() {
         g_opp_info = info;
         g_pred = state ? pred : "EMPTY";
     }
-    if (state) JLOGI("%s", info);
+    if (state) { JOKF("F3", "%s", info); }
+    else { err_throttle("F3", "no_opp_rank", 20, info); }
 }
 
 // ---- 头像位置：右侧几何 8 槽（无 FindObjectOfType / 无 Unity.Screen）----
@@ -817,12 +838,14 @@ static void refresh_positions() {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
     if (!battle) {
+        err_throttle("F4", "no_battle", 30, "positions");
         std::lock_guard<std::mutex> lk(g_mu);
         g_pos = "EMPTY";
         return;
     }
     int myId = get_my_id(battle, cbm);
     if (!pid_ok(myId)) {
+        err_throttle("F4", "bad_myId", 20, "positions");
         std::lock_guard<std::mutex> lk(g_mu);
         g_pos = "EMPTY";
         return;
@@ -1112,7 +1135,7 @@ static void try_auto_buy() {
     auto stage = get_stage_recommend_data();
     if (!stage) {
         static int miss;
-        if ((++miss % 15) == 1) slog("auto_buy: no CurrentStageRecommendData (未应用阵容?)");
+        if ((++miss % 15) == 1) { err_throttle("F2", "no_stage", 1, "apply TeamRecommend lineup"); slog("auto_buy: no_stage"); }
         {
             std::lock_guard<std::mutex> lk(g_mu);
             g_lineup_dbg = "no_stage";
@@ -1131,12 +1154,12 @@ static void try_auto_buy() {
     Il2CppClass *hrc = find_class("ZGameChess", "HeroRoot");
     if (!hrc) hrc = find_class("", "HeroRoot");
     if (!hrc) {
-        slog("auto_buy: HeroRoot class missing");
+        JERRF("F2", "HeroRoot_class_missing"); slog("auto_buy: HeroRoot class missing");
         return;
     }
     auto mBuy = meth(hrc, "ReqBuyHero", 0);
     if (!mBuy) {
-        slog("auto_buy: ReqBuyHero missing");
+        JERRF("F2", "ReqBuyHero_method_missing"); slog("auto_buy: ReqBuyHero missing");
         return;
     }
 
@@ -1145,7 +1168,7 @@ static void try_auto_buy() {
     int n = read_shop_slots(slots, ids, 5);
     if (n <= 0) {
         static int noshop;
-        if ((++noshop % 10) == 1) slog("auto_buy: shop empty / no BuyHeroView");
+        if ((++noshop % 10) == 1) { err_throttle("F2", "no_shop", 1, "BuyHeroView empty"); slog("auto_buy: shop empty"); }
         return;
     }
 
@@ -1160,15 +1183,14 @@ static void try_auto_buy() {
         inv(mBuy, slots[i], nullptr);
         char msg[96];
         snprintf(msg, sizeof(msg), "auto_buy BUY slot=%d heroId=%d (lineup match)", i, ids[i]);
-        slog(msg);
-        return; // 每轮最多买一张，避免连点
+        slog(msg); JOKF("F2", "BUY %s", msg); return; // one per tick，避免连点
     }
     static int nomatch;
-    if ((++nomatch % 8) == 1) slog("auto_buy: shop has no lineup hero this tick");
+    if ((++nomatch % 8) == 1) { err_throttle("F2", "no_lineup_hero_in_shop", 1, "shop ids not in lineup"); slog("auto_buy: no_match"); }
 }
 
 static std::string handle(const char *req) {
-    if (!req || !*req) return "RSP:ERR\n";
+    if (!req || !*req) { JERRF("PROTO", "empty_req"); return "RSP:ERR\n"; }
     JLOGI("REQ %s", req);
 
     if (strncmp(req, "SET:", 4) == 0) {
@@ -1281,12 +1303,12 @@ static void *server(void *) {
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     a.sin_port = htons(PORT);
     if (bind(fd, (sockaddr *)&a, sizeof(a)) < 0) {
-        slog("FAIL bind 31338");
+        JERRF("SRV", "bind_31338_failed"); slog("FAIL bind 31338");
         close(fd);
         return nullptr;
     }
     listen(fd, 16);
-    slog("server 31338 ready hybrid " JCC_SEASON_TAG " no resource hooks");
+    slog("server 31338 ready " JCC_SEASON_TAG); JOKF("SRV", "listen_31338");
     while (g_run.load()) {
         int c = accept(fd, nullptr, nullptr);
         if (c < 0) continue;
@@ -1300,7 +1322,7 @@ static void *server(void *) {
 
 static void *worker(void *) {
     ensure_il2cpp_thread();
-    JCKPT("worker_start_2_6_3");
+    JCKPT("worker_start_full");
     for (int i = 0; i < 60; i++) {
         if (scan_heroes()) break;
         sleep(2);
@@ -1322,7 +1344,8 @@ static void *worker(void *) {
         if (g_op_board.load() && (tick % 3) == 0) refresh_opponent_board();
         if (g_auto_buy.load()) try_auto_buy();
         if ((tick % 10) == 0) {
-            std::string lineup, hex, pred, pos;
+            std::string lineup, hex, pred, pos, warn;
+            size_t pool_sz = 0;
             {
                 std::lock_guard<std::mutex> lk(g_mu);
                 if (!g_heroes.empty()) {
@@ -1332,12 +1355,18 @@ static void *worker(void *) {
                 lineup = g_lineup_dbg;
                 hex = g_hex;
                 pred = g_pred;
+                warn = g_warn;
+                pool_sz = g_pool.size();
                 pos = g_pos.size() > 40 ? g_pos.substr(0, 40) : g_pos;
             }
-            char hb[320];
-            snprintf(hb, sizeof(hb), "hb hex=%s pred=%s pos=%s ready=%d lineup=%s", hex.c_str(),
-                     pred.c_str(), pos.c_str(), g_overlay_ready.load() ? 1 : 0, lineup.c_str());
+            char hb[360];
+            snprintf(hb, sizeof(hb),
+                     "hb hex=%s pred=%s pos=%s ready=%d lineup=%s auto=%d board=%d",
+                     hex.c_str(), pred.c_str(), pos.c_str(), g_overlay_ready.load() ? 1 : 0,
+                     lineup.c_str(), g_auto_buy.load() ? 1 : 0, g_op_board.load() ? 1 : 0);
             slog(hb);
+            JLOGI("STATUS F1pool=%zu F3pred=%s F5warn_len=%zu ready=%d F2lineup=%s", pool_sz,
+                  pred.c_str(), warn.size(), g_overlay_ready.load() ? 1 : 0, lineup.c_str());
         }
     }
     return nullptr;
@@ -1349,6 +1378,9 @@ void cardpool_start(const char *game_data_dir) {
     JccFileLog::I().init(game_data_dir);
     g_run.store(true);
     JCKPT("full_kernel_1_0_0_start");
+    JLOGI("LOG_PATHS game/files/jcc_full.log + /sdcard/Download/jcc-scan/jcc_full.log");
+    JLOGI("LOG_ERR jcc_last_error.txt + jcc_errors.log (same dirs)");
+    JLOGI("LOG_PULL adb pull /sdcard/Download/jcc-scan/");
     slog("FULL_KERNEL_" JCC_SEASON_TAG " overlay-safe no-UnityScreen " JCC_SEASON_SCAN_DATE);
 
     if (il2cpp_domain_get && il2cpp_thread_attach) {
