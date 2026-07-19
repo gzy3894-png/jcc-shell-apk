@@ -1,8 +1,8 @@
-/* JCC season fields — machine-scanned 2026-07-18 + dump/SO certified 2026-07-19 */
+/* JCC season fields — dump.cs + scan + 用户确认：自动买=阵容内存匹配 */
 #pragma once
 
-#define JCC_SEASON_TAG "2.6.2"
-#define JCC_SEASON_SCAN_DATE "2026-07-18"
+#define JCC_SEASON_TAG "2.6.3"
+#define JCC_SEASON_SCAN_DATE "2026-07-19"
 
 /* TACG_Hero_Client (MATCH original SO 0x7e4bc) */
 #define JCC_HERO_IID 0x10
@@ -43,7 +43,30 @@
 #define JCC_BH_LIST_HERO 0x148
 #define JCC_BH_CUR_PM 0x168
 #define JCC_HR_INDEX 0x160
+#define JCC_HR_TAC_BUY 0x1a8 /* TAC_BuyHero* */
 #define JCC_HR_DATA_ID 0x1b0
+
+/* TAC_BuyHero / TAC_HeroEntity — 商店槽 conf id */
+#define JCC_TB_HERO_ENTITY 0x10
+#define JCC_HE_ENTITY_ID 0x10
+#define JCC_HE_HERO_CONF 0x14
+
+/* 金铲铲自带阵容 TeamRecommend（用户确认：自动买读这个） */
+#define JCC_TRC_MODEL 0x88                 /* TeamRecommendController._teamRecommendModel */
+#define JCC_TRM_CUR_RECOMMEND 0x40         /* CurrentRecommendData */
+#define JCC_TRM_CUR_STAGE_DATA 0x50        /* CurrentStageRecommendData */
+#define JCC_SRTD_HERO_EQUIPS 0x10          /* HeroAndEquipments dict */
+#define JCC_SRTD_CORE_HERO 0x50           /* CoreHeroId */
+
+/* ChessBattleGlobal → BuyHeroView（无 FindObjectOfType） */
+#define JCC_CBG_SCREEN_MGR 0x108          /* battleScreenMgr */
+#define JCC_BSM_SCREEN 0x10               /* BattleScreenMgr.battleScreen */
+
+/* ChessBattleModel */
+#define JCC_CBM_PLAYER_DICT 0x38
+#define JCC_CBM_CUR_TURN 0x130
+#define JCC_CBM_PLAYBOOK_ID 0x1e8
+#define JCC_CBM_MY_MATCH_LIST 0x268
 
 /* TACG_HABasicConfig_Client */
 #define JCC_HA_IID 0x10
