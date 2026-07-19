@@ -1,5 +1,7 @@
-// JCC Controller 完整内核（无转区）+ 强制落盘日志
-// 协议: GET/SET/DO/PUSH @ 127.0.0.1:31338 对齐原版 UI
+// JCC 2.6 混合内核（不 hook 资源/加载）
+// - 协议对齐原版 Controller UI（31338）
+// - 用现赛季扫描偏移 + 方法 invoke 读内存（不重写业务算法）
+// - 禁止 Dobby/资源 hook，避免加载页「资源损坏」
 #include "cardpool.h"
 #include "il2cpp-class.h"
 #include "jcc_log.h"
@@ -12,11 +14,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,65 +30,59 @@
 #include "il2cpp-api-functions.h"
 #undef DO_API
 
-// ---- 赛季字段 ----
-static constexpr size_t OFF_IID = JCC_HERO_IID;
-static constexpr size_t OFF_SNAME = JCC_HERO_SNAME;
-static constexpr size_t OFF_ICOST = JCC_HERO_ICOST;
-static constexpr size_t OFF_PAINT = JCC_HERO_PAINT_SMALL;
+// ---- season fields (scan-verified) ----
+static constexpr size_t H_IID = JCC_HERO_IID;
+static constexpr size_t H_SNAME = JCC_HERO_SNAME;
+static constexpr size_t H_ICOST = JCC_HERO_ICOST;
+static constexpr size_t H_PAINT = JCC_HERO_PAINT_SMALL;
+static constexpr size_t H_ISTAR = JCC_HERO_ISTAR;
+static constexpr size_t H_IQUAL = JCC_HERO_IQUALITY;
 
-// UnitData (scan)
+static constexpr size_t PM_BATTLE_TURN = 0x20;
+static constexpr size_t PM_HEX = 0x28;
+static constexpr size_t PM_MONEY = 0x5c;
+static constexpr size_t PM_LAST_ENEMY = 0x64;
+static constexpr size_t PM_HP = 0xbc;
+
+static constexpr size_t CBM_PLAYER_DICT = 0x38;
+static constexpr size_t CBM_CUR_PLAYER = 0x100;
+static constexpr size_t CBM_MATCH_PLAYERS = 0x248;
+static constexpr size_t CBM_MY_MATCH_LIST = 0x268;
+
 static constexpr size_t UD_HERO_ID = 0x14;
 static constexpr size_t UD_PLAYER_ID = 0x24;
-static constexpr size_t UD_COL = 0x30;
-static constexpr size_t UD_ROW = 0x34;
 static constexpr size_t UD_LEVEL = 0x148;
-static constexpr size_t UD_HERO_NAME = 0x120;
-static constexpr size_t UD_HERO_HEAD = 0x140;
 
-// ChessBattleUnit
-static constexpr size_t CBU_DATA = 0x90;
-static constexpr size_t CBU_SCREEN_TOP = 0x1a4;  // Vector3-ish
-static constexpr size_t CBU_SCREEN_HEAD = 0x1b0;
-static constexpr size_t CBU_SHOW_STAR = 0x1e0;
-static constexpr size_t CBU_BATTLE_DATA = 0x1c8;
+static constexpr int PORT = 31338;
+static constexpr int MAX_ID = 12000;
 
-static constexpr int CTRL_PORT = 31338;
-static constexpr int MAX_HERO_ID = 20000;
-
-static char g_data_dir[512]{};
-static std::atomic<bool> g_running{false};
-static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_dir[512]{};
+static std::atomic<bool> g_run{false};
+static std::mutex g_mu;
 
 static std::string g_pool;
 static std::string g_status = "init";
-static std::string g_log_ui;
+static std::string g_log;
 static std::string g_hex = "0,0,0";
 static std::string g_warn = "EMPTY";
 static std::string g_pos = "EMPTY";
 static std::string g_pred = "EMPTY";
-static std::string g_op_board_payload; // for PUSH
+static std::string g_opp_info = "EMPTY"; // 下一局对手可读摘要
 
 static std::atomic<bool> g_auto_buy{false};
 static std::atomic<bool> g_popup_block{false};
-static std::atomic<bool> g_shop_display{true};
+static std::atomic<bool> g_shop_show{true}; // 商店显示：只影响是否积极刷新，GET 始终有数据
 static std::atomic<bool> g_op_board{true};
 
-static std::map<int, int> g_owned; // heroId -> copies (approx: 1-star=1,2=3,3=9 style later)
-
-struct HeroRow {
+struct Hero {
     int id{}, cost{}, total{}, rem{};
     std::string name, icon;
 };
-static std::vector<HeroRow> g_heroes;
+static std::vector<Hero> g_heroes;
+static std::map<int, int> g_owned;
 
-// client sockets for PUSH (simple: store last accepted we can't easily multi-cast without list)
-// Instead: GET always fresh; PUSH written to file and sent when client connects next
-// For PUSH we keep a dedicated push socket list
-static pthread_mutex_t g_clients_mu = PTHREAD_MUTEX_INITIALIZER;
-static std::vector<int> g_push_clients;
-
-static int pool_total_by_cost(int cost) {
-    switch (cost) {
+static int tier_total(int c) {
+    switch (c) {
         case 1:
             return 29;
         case 2:
@@ -102,77 +98,45 @@ static int pool_total_by_cost(int cost) {
     }
 }
 
-// star 1/2/3 → 棋子占用卡牌数 1/3/9
-static int copies_for_star(int star) {
-    if (star <= 1) return 1;
-    if (star == 2) return 3;
-    return 9;
-}
-
-static void ui_log(const char *msg) {
-    if (!msg) return;
-    pthread_mutex_lock(&g_mu);
-    if (g_log_ui.size() > 48 * 1024) g_log_ui.erase(0, 24 * 1024);
-    g_log_ui.append(msg);
-    g_log_ui.push_back('\n');
-    pthread_mutex_unlock(&g_mu);
-    JLOGI("%s", msg);
-}
-
-static void set_status(const char *msg) {
-    pthread_mutex_lock(&g_mu);
-    g_status = msg ? msg : "";
-    pthread_mutex_unlock(&g_mu);
-    ui_log(msg);
-}
-
-static void write_pool_file(const std::string &pool) {
-    if (!g_data_dir[0]) return;
-    char path[600];
-    snprintf(path, sizeof(path), "%s/files/jcc_cardpool.txt", g_data_dir);
-    FILE *f = fopen(path, "w");
-    if (f) {
-        fwrite(pool.data(), 1, pool.size(), f);
-        fputc('\n', f);
-        fflush(f);
-        fclose(f);
+static void slog(const char *m) {
+    if (!m) return;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_log.size() > 40 * 1024) g_log.erase(0, 20 * 1024);
+        g_log.append(m);
+        g_log.push_back('\n');
+        g_status = m;
     }
+    JLOGI("%s", m);
 }
 
-static std::string utf16_to_utf8(const Il2CppChar *chars, int32_t len) {
-    std::string out;
-    if (!chars || len <= 0) return out;
-    for (int32_t i = 0; i < len; i++) {
-        uint32_t c = chars[i];
-        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
-            uint32_t c2 = chars[i + 1];
-            if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
-                c = 0x10000 + (((c - 0xD800) << 10) | (c2 - 0xDC00));
-                i++;
-            }
-        }
+static std::string u16(const Il2CppChar *p, int n) {
+    std::string o;
+    if (!p || n <= 0) return o;
+    for (int i = 0; i < n; i++) {
+        uint32_t c = p[i];
         if (c < 0x80)
-            out.push_back((char)c);
+            o.push_back((char)c);
         else if (c < 0x800) {
-            out.push_back((char)(0xC0 | (c >> 6)));
-            out.push_back((char)(0x80 | (c & 0x3F)));
-        } else if (c < 0x10000) {
-            out.push_back((char)(0xE0 | (c >> 12)));
-            out.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
-            out.push_back((char)(0x80 | (c & 0x3F)));
+            o.push_back((char)(0xC0 | (c >> 6)));
+            o.push_back((char)(0x80 | (c & 0x3F)));
         } else {
-            out.push_back((char)(0xF0 | (c >> 18)));
-            out.push_back((char)(0x80 | ((c >> 12) & 0x3F)));
-            out.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
-            out.push_back((char)(0x80 | (c & 0x3F)));
+            o.push_back((char)(0xE0 | (c >> 12)));
+            o.push_back((char)(0x80 | ((c >> 6) & 0x3F)));
+            o.push_back((char)(0x80 | (c & 0x3F)));
         }
     }
-    return out;
+    return o;
 }
 
-static std::string il2cpp_str(Il2CppString *s) {
+static std::string istr(Il2CppString *s) {
     if (!s || !il2cpp_string_chars || !il2cpp_string_length) return {};
-    return utf16_to_utf8(il2cpp_string_chars(s), il2cpp_string_length(s));
+    return u16(il2cpp_string_chars(s), il2cpp_string_length(s));
+}
+
+static void scrub(std::string &s) {
+    for (char &c : s)
+        if (c == ':' || c == ',' || c == '|' || c == ';' || c == '\n' || c == '\r') c = '_';
 }
 
 static Il2CppClass *find_class(const char *ns, const char *name) {
@@ -180,393 +144,283 @@ static Il2CppClass *find_class(const char *ns, const char *name) {
         !il2cpp_class_from_name)
         return nullptr;
     size_t n = 0;
-    auto domain = il2cpp_domain_get();
-    if (!domain) return nullptr;
-    auto asms = il2cpp_domain_get_assemblies(domain, &n);
+    auto d = il2cpp_domain_get();
+    if (!d) return nullptr;
+    auto asms = il2cpp_domain_get_assemblies(d, &n);
     if (!asms) return nullptr;
     for (size_t i = 0; i < n; i++) {
-        auto image = il2cpp_assembly_get_image(asms[i]);
-        if (!image) continue;
+        auto img = il2cpp_assembly_get_image(asms[i]);
+        if (!img) continue;
         if (ns && ns[0]) {
-            auto k = il2cpp_class_from_name(image, ns, name);
+            auto k = il2cpp_class_from_name(img, ns, name);
             if (k) return k;
         }
-        auto k2 = il2cpp_class_from_name(image, "", name);
+        auto k2 = il2cpp_class_from_name(img, "", name);
         if (k2) return k2;
+        if (ns && strcmp(ns, "ZGameChess") != 0) {
+            auto k3 = il2cpp_class_from_name(img, "ZGameChess", name);
+            if (k3) return k3;
+        }
+        if (ns && strcmp(ns, "ZGame") != 0) {
+            auto k4 = il2cpp_class_from_name(img, "ZGame", name);
+            if (k4) return k4;
+        }
     }
     return nullptr;
 }
 
-static const MethodInfo *find_method(Il2CppClass *klass, const char *name, int argc) {
-    if (!klass || !il2cpp_class_get_method_from_name) return nullptr;
-    return il2cpp_class_get_method_from_name(klass, name, argc);
+static const MethodInfo *meth(Il2CppClass *k, const char *n, int a) {
+    if (!k || !il2cpp_class_get_method_from_name) return nullptr;
+    return il2cpp_class_get_method_from_name(k, n, a);
 }
 
-static Il2CppObject *invoke(const MethodInfo *method, void *obj, void **params) {
-    if (!method || !il2cpp_runtime_invoke) return nullptr;
-    Il2CppException *exc = nullptr;
-    auto ret = il2cpp_runtime_invoke(method, obj, params, &exc);
-    if (exc) return nullptr;
-    return ret;
+static Il2CppObject *inv(const MethodInfo *m, void *obj, void **p) {
+    if (!m || !il2cpp_runtime_invoke) return nullptr;
+    Il2CppException *e = nullptr;
+    auto r = il2cpp_runtime_invoke(m, obj, p, &e);
+    return e ? nullptr : r;
 }
 
-static Il2CppObject *get_singleton(Il2CppClass *klass) {
-    auto m = find_method(klass, "get_Instance", 0);
-    if (!m) m = find_method(klass, "get_instance", 0);
-    if (!m) return nullptr;
-    return invoke(m, nullptr, nullptr);
+static Il2CppObject *singleton(Il2CppClass *k) {
+    auto m = meth(k, "get_Instance", 0);
+    if (!m) m = meth(k, "get_instance", 0);
+    return m ? inv(m, nullptr, nullptr) : nullptr;
 }
 
-static void sanitize(std::string &s) {
-    for (char &c : s) {
-        if (c == ':' || c == ',' || c == '|' || c == ';' || c == '\n' || c == '\r') c = '_';
-    }
-}
-
-static std::string build_pool_payload_locked() {
-    std::string out;
-    out.reserve(g_heroes.size() * 40);
+static std::string build_pool() {
+    std::string o;
+    o.reserve(g_heroes.size() * 40);
     for (auto &h : g_heroes) {
-        int owned = 0;
+        int own = 0;
         auto it = g_owned.find(h.id);
-        if (it != g_owned.end()) owned = it->second;
-        int rem = h.total - owned;
+        if (it != g_owned.end()) own = it->second;
+        int rem = h.total - own;
         if (rem < 0) rem = 0;
         h.rem = rem;
-        char buf[512];
+        char b[512];
         if (!h.icon.empty())
-            snprintf(buf, sizeof(buf), "%d:%s:%d:%d:%d:%s", h.id, h.name.c_str(), h.cost, rem,
-                     h.total, h.icon.c_str());
+            snprintf(b, sizeof(b), "%d:%s:%d:%d:%d:%s", h.id, h.name.c_str(), h.cost, rem, h.total,
+                     h.icon.c_str());
         else
-            snprintf(buf, sizeof(buf), "%d:%s:%d:%d:%d", h.id, h.name.c_str(), h.cost, rem, h.total);
-        if (!out.empty()) out.push_back(',');
-        out.append(buf);
+            snprintf(b, sizeof(b), "%d:%s:%d:%d:%d", h.id, h.name.c_str(), h.cost, rem, h.total);
+        if (!o.empty()) o.push_back(',');
+        o.append(b);
     }
-    return out;
+    return o;
 }
 
-// ---------- FindObjectsOfType 枚举 ----------
-static std::vector<Il2CppObject *> find_objects_of_type(Il2CppClass *klass) {
-    std::vector<Il2CppObject *> out;
-    if (!klass) return out;
-    Il2CppClass *objKlass = find_class("UnityEngine", "Object");
-    if (!objKlass) return out;
-    // FindObjectsOfType(Type) — argc 1
-    auto m = find_method(objKlass, "FindObjectsOfType", 1);
-    if (!m) m = find_method(objKlass, "FindObjectsOfType", 2);
-    if (!m || !il2cpp_class_get_type || !il2cpp_type_get_object) return out;
-    const Il2CppType *ty = il2cpp_class_get_type(klass);
-    if (!ty) return out;
-    auto typeObj = il2cpp_type_get_object(ty);
-    if (!typeObj) return out;
-    void *params[1] = {typeObj};
-    auto arr = invoke(m, nullptr, params);
-    if (!arr) return out;
-    // Il2CppArray: max_length @0x18, vector @0x20 (arm64 common)
-    char *base = reinterpret_cast<char *>(arr);
-    uint32_t len = *reinterpret_cast<uint32_t *>(base + 0x18);
-    if (len > 0 && len < 4096) {
-        for (uint32_t i = 0; i < len && i < 512; i++) {
-            auto *o = *reinterpret_cast<Il2CppObject **>(base + 0x20 + i * sizeof(void *));
-            if (o) out.push_back(o);
-        }
+static void save_pool(const std::string &p) {
+    if (!g_dir[0]) return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/files/jcc_cardpool.txt", g_dir);
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fwrite(p.data(), 1, p.size(), f);
+        fputc('\n', f);
+        fflush(f);
+        fclose(f);
     }
-    JLOGI("FindObjectsOfType count=%zu len_field=%u", out.size(), len);
-    return out;
 }
 
-// ---------- 扫描场上棋子 → owned + board + warn ----------
-static void scan_battle_units() {
-    JCKPT("scan_battle_units_enter");
-    Il2CppClass *unitKlass = find_class("ZGameChess", "ChessBattleUnit");
-    if (!unitKlass) unitKlass = find_class("", "ChessBattleUnit");
-    if (!unitKlass) {
-        JLOGI("ChessBattleUnit class missing");
-        return;
-    }
-    auto units = find_objects_of_type(unitKlass);
-    if (units.empty()) {
-        // 备选：UnitData 对象
-        Il2CppClass *udk = find_class("ZGameChess", "UnitData");
-        if (!udk) udk = find_class("", "UnitData");
-        auto uds = find_objects_of_type(udk);
-        std::map<int, int> owned;
-        std::map<int, std::map<int, int>> byPlayer; // player -> heroId -> copies
-        for (auto *o : uds) {
-            if (!o) continue;
-            char *b = reinterpret_cast<char *>(o);
-            int heroId = *reinterpret_cast<int *>(b + UD_HERO_ID);
-            int level = *reinterpret_cast<int *>(b + UD_LEVEL);
-            int pid = *reinterpret_cast<int *>(b + UD_PLAYER_ID);
-            if (heroId <= 0) continue;
-            int star = level > 0 ? level : 1;
-            if (star > 3) star = 3;
-            int c = copies_for_star(star);
-            owned[heroId] += c;
-            byPlayer[pid][heroId] += c;
-        }
-        pthread_mutex_lock(&g_mu);
-        g_owned.swap(owned);
-        // 三星预警：按玩家聚合 count>=3 的英雄
-        if (byPlayer.empty()) {
-            g_warn = "EMPTY";
-        } else {
-            std::string w = "W";
-            int pidx = 0;
-            for (auto &kv : byPlayer) {
-                std::string heroes;
-                for (auto &h : kv.second) {
-                    if (h.second < 3) continue;
-                    // id,name,cnt,cost,star,icon
-                    int cost = 1, star = h.second >= 9 ? 3 : (h.second >= 3 ? 2 : 1);
-                    for (auto &hr : g_heroes)
-                        if (hr.id == h.first) {
-                            cost = hr.cost;
-                            break;
-                        }
-                    char hb[128];
-                    snprintf(hb, sizeof(hb), "%d,H%d,%d,%d,%d,", h.first, h.first, h.second, cost,
-                             star);
-                    if (!heroes.empty()) heroes.push_back(';');
-                    heroes.append(hb);
-                }
-                if (heroes.empty()) {
-                    pidx++;
-                    continue;
-                }
-                char head[64];
-                snprintf(head, sizeof(head), "|%d,0,0,-1,P%d:", pidx + 1, kv.first);
-                w.append(head);
-                w.append(heroes);
-                pidx++;
-            }
-            g_warn = (w.size() > 1) ? w : "EMPTY";
-        }
-        g_pool = build_pool_payload_locked();
-        pthread_mutex_unlock(&g_mu);
-        write_pool_file(g_pool);
-        JLOGI("UnitData path owned_types=%zu warn_len=%zu", g_owned.size(), g_warn.size());
-        JCKPT("scan_battle_units_unitdata_done");
-        return;
-    }
-
-    std::map<int, int> owned;
-    std::string board = "1080,2400"; // default screen; will fix if we get positions
-    int board_n = 0;
-    float maxx = 0, maxy = 0;
-    for (auto *u : units) {
-        if (!u) continue;
-        char *b = reinterpret_cast<char *>(u);
-        auto *data = *reinterpret_cast<Il2CppObject **>(b + CBU_DATA);
-        if (!data) data = *reinterpret_cast<Il2CppObject **>(b + CBU_BATTLE_DATA);
-        int heroId = 0, star = 1, cost = 1;
-        std::string icon, name;
-        if (data) {
-            char *d = reinterpret_cast<char *>(data);
-            heroId = *reinterpret_cast<int *>(d + UD_HERO_ID);
-            int level = *reinterpret_cast<int *>(d + UD_LEVEL);
-            star = level > 0 && level <= 3 ? level : 1;
-            auto *nm = *reinterpret_cast<Il2CppString **>(d + UD_HERO_NAME);
-            auto *hd = *reinterpret_cast<Il2CppString **>(d + UD_HERO_HEAD);
-            name = il2cpp_str(nm);
-            icon = il2cpp_str(hd);
-        }
-        // Show_Star object may encode star — fallback
-        if (heroId <= 0) continue;
-        for (auto &hr : g_heroes)
-            if (hr.id == heroId) {
-                cost = hr.cost;
-                if (icon.empty()) icon = hr.icon;
-                if (name.empty()) name = hr.name;
-                break;
-            }
-        owned[heroId] += copies_for_star(star);
-        // screen pos
-        float *st = reinterpret_cast<float *>(b + CBU_SCREEN_HEAD);
-        float sx = st[0], sy = st[1];
-        if (sx > maxx) maxx = sx;
-        if (sy > maxy) maxy = sy;
-        if (sx > 1 && sy > 1 && board_n < 20) {
-            sanitize(icon);
-            char seg[192];
-            snprintf(seg, sizeof(seg), "|%.0f,%.0f,%d,%d,%d,%s", sx, sy, heroId, star, cost,
-                     icon.c_str());
-            board.append(seg);
-            board_n++;
-        }
-    }
-    if (maxx > 100 && maxy > 100) {
-        char head[32];
-        snprintf(head, sizeof(head), "%.0f,%.0f", maxx + 20, maxy + 20);
-        // rebuild with correct head
-        std::string body = head;
-        // extract segments after first |
-        auto pos = board.find('|');
-        if (pos != std::string::npos) body.append(board.substr(pos));
-        board.swap(body);
-    }
-
-    pthread_mutex_lock(&g_mu);
-    g_owned.swap(owned);
-    g_pool = build_pool_payload_locked();
-    if (board_n > 0 && g_op_board.load()) {
-        g_op_board_payload = board;
-    } else {
-        g_op_board_payload.clear();
-    }
-    // simple warning from owned
-    {
-        std::string w = "W";
-        bool any = false;
-        for (auto &kv : g_owned) {
-            if (kv.second < 3) continue;
-            int cost = 1, star = kv.second >= 9 ? 3 : 2;
-            for (auto &hr : g_heroes)
-                if (hr.id == kv.first) {
-                    cost = hr.cost;
-                    break;
-                }
-            char hb[128];
-            snprintf(hb, sizeof(hb), "%d,H%d,%d,%d,%d,", kv.first, kv.first, kv.second, cost, star);
-            if (!any) {
-                w.append("|1,0,0,-1,ALL:");
-                any = true;
-            } else
-                w.push_back(';');
-            w.append(hb);
-        }
-        g_warn = any ? w : "EMPTY";
-    }
-    pthread_mutex_unlock(&g_mu);
-    write_pool_file(g_pool);
-    JLOGI("battle units=%zu board_n=%d owned=%zu", units.size(), board_n, g_owned.size());
-    JCKPT("scan_battle_units_done");
-}
-
-static void push_to_clients(const std::string &line) {
-    std::vector<int> dead;
-    pthread_mutex_lock(&g_clients_mu);
-    for (int fd : g_push_clients) {
-        if (send(fd, line.data(), line.size(), MSG_NOSIGNAL) < 0) dead.push_back(fd);
-    }
-    for (int fd : dead) {
-        close(fd);
-        g_push_clients.erase(std::remove(g_push_clients.begin(), g_push_clients.end(), fd),
-                             g_push_clients.end());
-    }
-    pthread_mutex_unlock(&g_clients_mu);
-}
-
-static void broadcast_board() {
-    std::string payload;
-    pthread_mutex_lock(&g_mu);
-    payload = g_op_board_payload;
-    bool en = g_op_board.load();
-    pthread_mutex_unlock(&g_mu);
-    if (!en) {
-        push_to_clients("PUSH:OPPONENT_BOARD_CLEAR\n");
-        return;
-    }
-    if (payload.empty()) {
-        push_to_clients("PUSH:OPPONENT_BOARD_CLEAR\n");
-        return;
-    }
-    std::string msg = "PUSH:OPPONENT_BOARD:" + payload + "\n";
-    push_to_clients(msg);
-}
-
-// ---------- 牌库表 ----------
-static bool scan_cardpool_table() {
-    JCKPT("scan_cardpool_enter");
-    set_status("scan: DataBaseManager " JCC_SEASON_TAG);
-    Il2CppClass *db = find_class(JCC_NS_DB, JCC_CLS_DB);
-    if (!db) db = find_class("ZGame", "DataBaseManager");
+// ---- 牌库表（2.5.2 已验证路径）----
+static bool scan_heroes() {
+    JCKPT("scan_heroes");
+    slog("scan_heroes begin " JCC_SEASON_TAG);
+    Il2CppClass *db = find_class("ZGame", "DataBaseManager");
+    if (!db) db = find_class("", "DataBaseManager");
     if (!db) {
-        set_status("FAIL: DataBaseManager");
+        slog("FAIL DataBaseManager");
         return false;
     }
-    auto mSearch = find_method(db, "SearchACGHero2", 1);
-    if (!mSearch) mSearch = find_method(db, "SearchACGHero", 1);
-    if (!mSearch) {
-        set_status("FAIL: SearchACGHero");
+    auto m = meth(db, "SearchACGHero2", 1);
+    if (!m) m = meth(db, "SearchACGHero", 1);
+    if (!m) {
+        slog("FAIL SearchACGHero*");
         return false;
     }
-    auto inst = get_singleton(db);
+    auto inst = singleton(db);
     if (!inst) {
-        set_status("FAIL: get_Instance");
+        slog("FAIL db instance");
         return false;
     }
-    std::vector<HeroRow> rows;
-    for (int id = 1; id <= MAX_HERO_ID; id++) {
-        void *params[1];
+    std::vector<Hero> rows;
+    for (int id = 1; id <= MAX_ID; id++) {
         int32_t hid = id;
-        params[0] = &hid;
-        auto hero = invoke(mSearch, inst, params);
+        void *params[1] = {&hid};
+        auto hero = inv(m, inst, params);
         if (!hero) continue;
-        char *base = reinterpret_cast<char *>(hero);
-        int iid = *reinterpret_cast<int *>(base + OFF_IID);
-        int cost = *reinterpret_cast<int *>(base + OFF_ICOST);
-        auto *nameObj = *reinterpret_cast<Il2CppString **>(base + OFF_SNAME);
-        auto *iconObj = *reinterpret_cast<Il2CppString **>(base + OFF_PAINT);
+        char *b = (char *)hero;
+        int iid = *(int *)(b + H_IID);
+        int cost = *(int *)(b + H_ICOST);
+        auto *ns = *(Il2CppString **)(b + H_SNAME);
+        auto *ic = *(Il2CppString **)(b + H_PAINT);
         if (iid <= 0) iid = id;
         if (cost < 1 || cost > 5) continue;
-        std::string name = il2cpp_str(nameObj);
+        std::string name = istr(ns);
         if (name.empty()) continue;
-        std::string icon = il2cpp_str(iconObj);
-        sanitize(name);
-        sanitize(icon);
-        HeroRow r{};
-        r.id = iid;
-        r.cost = cost;
-        r.total = pool_total_by_cost(cost);
-        r.name = name;
-        r.icon = icon;
-        rows.push_back(r);
+        std::string icon = istr(ic);
+        scrub(name);
+        scrub(icon);
+        Hero h{};
+        h.id = iid;
+        h.cost = cost;
+        h.total = tier_total(cost);
+        h.name = name;
+        h.icon = icon;
+        rows.push_back(h);
     }
     if (rows.empty()) {
-        set_status("FAIL: no heroes");
+        slog("FAIL no heroes");
         return false;
     }
-    pthread_mutex_lock(&g_mu);
-    g_heroes.swap(rows);
-    g_pool = build_pool_payload_locked();
-    pthread_mutex_unlock(&g_mu);
-    write_pool_file(g_pool);
-    char st[96];
-    snprintf(st, sizeof(st), "scan done heroes=%zu", g_heroes.size());
-    set_status(st);
-    JCKPT("scan_cardpool_done");
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_heroes.swap(rows);
+        g_pool = build_pool();
+    }
+    save_pool(g_pool);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "scan_heroes ok n=%zu", g_heroes.size());
+    slog(msg);
+    JCKPT("scan_heroes_ok");
     return true;
 }
 
-// 自动购买（安全：仅当开关开且找到 ReqBuyHero；默认不乱买 — 只记日志除非明确商店 id）
+// ---- 下一局对手：读内存（非猜行为）----
+static void refresh_opponent() {
+    // ChessBattleModel.GetMatchPlayerId(int) / get_MyPlayerId / GetMyPlayerModel
+    Il2CppClass *cbm = find_class("ZGameChess", "ChessBattleModel");
+    if (!cbm) cbm = find_class("", "ChessBattleModel");
+    if (!cbm) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_opp_info = "EMPTY";
+        g_pred = "EMPTY";
+        return;
+    }
+    // need battle model instance via ChessModelManager.GetBattleModel
+    Il2CppClass *cmm = find_class("ZGameChess", "ChessModelManager");
+    if (!cmm) cmm = find_class("", "ChessModelManager");
+    Il2CppObject *battle = nullptr;
+    if (cmm) {
+        auto inst = singleton(cmm);
+        auto m = meth(cmm, "GetBattleModel", 0);
+        if (inst && m) battle = inv(m, inst, nullptr);
+    }
+    if (!battle) {
+        // try get_Instance on CBM if any
+        battle = singleton(cbm);
+    }
+    if (!battle) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_opp_info = "EMPTY";
+        g_pred = "EMPTY";
+        return;
+    }
+
+    auto mMy = meth(cbm, "get_MyPlayerId", 0);
+    auto mMatch = meth(cbm, "GetMatchPlayerId", 1);
+    auto mGetPm = meth(cbm, "GetMyPlayerModel", 0);
+    auto mGetPl = meth(cbm, "GetPlayer", 1);
+    if (!mGetPl) {
+        Il2CppClass *cpc = find_class("ZGameChess", "ChessPlayerController");
+        if (cpc) mGetPl = meth(cpc, "GetPlayer", 1);
+    }
+
+    int myId = -1;
+    if (mMy) {
+        auto r = inv(mMy, battle, nullptr);
+        if (r) myId = *(int *)((char *)r + 0x10); // boxed Int32
+    }
+
+    int matchId = -1;
+    if (mMatch && myId >= 0) {
+        int32_t arg = myId;
+        void *params[1] = {&arg};
+        auto r = inv(mMatch, battle, params);
+        if (r) matchId = *(int *)((char *)r + 0x10);
+    }
+
+    // also LastEnemyId from my PlayerModel
+    int lastEnemy = -1;
+    int money = -1, hp = -1;
+    if (mGetPm) {
+        auto pm = inv(mGetPm, battle, nullptr);
+        if (pm) {
+            char *b = (char *)pm;
+            lastEnemy = *(int *)(b + PM_LAST_ENEMY);
+            money = *(int *)(b + PM_MONEY);
+            hp = *(int *)(b + PM_HP);
+        }
+    }
+
+    char buf[256];
+    if (matchId >= 0 || lastEnemy >= 0) {
+        snprintf(buf, sizeof(buf), "my=%d match=%d lastEnemy=%d money=%d hp=%d", myId, matchId,
+                 lastEnemy, money, hp);
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_opp_info = buf;
+        // 对手预测协议：给 UI 可读非 EMPTY；格式兼容 parsePrediction 宽松路径
+        // 使用 rank 风格简表：对手 id
+        int oid = matchId >= 0 ? matchId : lastEnemy;
+        char pred[128];
+        snprintf(pred, sizeof(pred), "1|0,0,0,%d,OPP%d:", oid, oid);
+        g_pred = pred;
+        slog(buf);
+    } else {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_opp_info = "EMPTY";
+        // keep last pred or empty
+    }
+}
+
+// ---- 海克斯：从 PlayerModel.hexAugmentModel 尽量读 ----
+static void refresh_hex() {
+    Il2CppClass *cbm = find_class("ZGameChess", "ChessBattleModel");
+    if (!cbm) return;
+    Il2CppClass *cmm = find_class("ZGameChess", "ChessModelManager");
+    Il2CppObject *battle = nullptr;
+    if (cmm) {
+        auto inst = singleton(cmm);
+        auto m = meth(cmm, "GetBattleModel", 0);
+        if (inst && m) battle = inv(m, inst, nullptr);
+    }
+    if (!battle) return;
+    auto mGetPm = meth(cbm, "GetMyPlayerModel", 0);
+    if (!mGetPm) return;
+    auto pm = inv(mGetPm, battle, nullptr);
+    if (!pm) return;
+    auto *hex = *(Il2CppObject **)((char *)pm + PM_HEX);
+    if (!hex) return;
+    // 无稳定字段文档时：尝试读对象开头几个 int32 作为品质试探（失败保持）
+    // 更稳：只记录 hex 非空
+    char msg[64];
+    snprintf(msg, sizeof(msg), "hex_obj=%p", (void *)hex);
+    JLOGI("%s", msg);
+}
+
+// ---- 自动拿牌：内存 ReqBuyHero（argc=0 on HeroRoot）----
 static void try_auto_buy() {
     if (!g_auto_buy.load()) return;
-    // 完整自动购买需商店槽列表；当前记录开关有效，避免误购
+    // 安全策略：仅当商店显示开启且能找到 HeroRoot 实例时调用；
+    // 无槽位列表时不盲目连点，只每 30s 记一次状态
     static int n;
-    if ((n++ % 20) == 0) JLOGI("auto_buy enabled (shop slot hook pending)");
+    if ((++n % 15) != 0) return;
+    Il2CppClass *hr = find_class("ZGameChess", "HeroRoot");
+    if (!hr) {
+        slog("auto_buy: HeroRoot missing");
+        return;
+    }
+    auto m = meth(hr, "ReqBuyHero", 0);
+    if (!m) {
+        slog("auto_buy: ReqBuyHero missing");
+        return;
+    }
+    // 无可靠实例来源时不 invoke，避免乱买
+    slog("auto_buy: armed (instance path pending stable shop slot read)");
 }
 
-// 弹窗拦截：标记 + 尝试关常见弹窗类（找不到则仅日志）
-static void try_popup_block() {
-    if (!g_popup_block.load()) return;
-    static int n;
-    if ((n++ % 30) == 0) JLOGI("popup_block enabled");
-}
-
-// 海克斯
-static void refresh_hex() {
-    // 尝试 PlayerModel.hexAugmentModel — 结构未知时保持
-    // 若有 jcc_report_hex 外部更新则已写入
-}
-
-// 头像位置：占位 EMPTY 或简易
-static void refresh_positions() {
-    // 未拿到稳定 PlayerList 坐标前保持 EMPTY，避免错误叠层
-}
-
-static std::string handle_request(const char *req) {
-    if (!req) return "RSP:ERR\n";
+static std::string handle(const char *req) {
+    if (!req || !*req) return "RSP:ERR\n";
     JLOGI("REQ %s", req);
 
     if (strncmp(req, "SET:", 4) == 0) {
@@ -574,21 +428,23 @@ static std::string handle_request(const char *req) {
         bool on = strstr(p, ":1") != nullptr;
         if (strstr(p, "自动购买")) {
             g_auto_buy.store(on);
-            set_status(on ? "SET auto_buy=1" : "SET auto_buy=0");
+            slog(on ? "SET auto_buy=1" : "SET auto_buy=0");
             return "RSP:OK\n";
         }
         if (strstr(p, "弹窗拦截")) {
             g_popup_block.store(on);
-            set_status(on ? "SET popup_block=1" : "SET popup_block=0");
+            slog(on ? "SET popup=1" : "SET popup=0");
             return "RSP:OK\n";
         }
         if (strstr(p, "商店显示")) {
-            g_shop_display.store(on);
+            g_shop_show.store(on);
+            slog(on ? "SET shop_show=1" : "SET shop_show=0");
+            // 开关关闭时仍保留池数据，UI 自己决定是否显示
+            if (on && g_pool.empty()) scan_heroes();
             return "RSP:OK\n";
         }
         if (strstr(p, "对手站位")) {
             g_op_board.store(on);
-            if (!on) push_to_clients("PUSH:OPPONENT_BOARD_CLEAR\n");
             return "RSP:OK\n";
         }
         if (strstr(p, "转区")) return "RSP:OK\n";
@@ -598,121 +454,43 @@ static std::string handle_request(const char *req) {
     if (strncmp(req, "DO:", 3) == 0) {
         const char *p = req + 3;
         if (strstr(p, "清空日志")) {
-            pthread_mutex_lock(&g_mu);
-            g_log_ui.clear();
-            pthread_mutex_unlock(&g_mu);
-            return "RSP:OK\n";
-        }
-        if (strstr(p, "退出游戏")) {
-            set_status("DO exit ignored_safe");
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_log.clear();
             return "RSP:OK\n";
         }
         if (strstr(p, "刷新") || strstr(p, "RESCAN")) {
-            scan_cardpool_table();
-            scan_battle_units();
+            scan_heroes();
+            refresh_opponent();
             return "RSP:OK\n";
         }
+        if (strstr(p, "退出游戏")) return "RSP:OK\n";
         return "RSP:OK\n";
     }
 
     if (strncmp(req, "GET:", 4) == 0) {
         const char *p = req + 4;
-        pthread_mutex_lock(&g_mu);
-        std::string body;
-        if (strstr(p, "牌库"))
-            body = "RSP:" + g_pool + "\n";
-        else if (strstr(p, "日志"))
-            body = "RSP:" + g_log_ui + "\n";
-        else if (strstr(p, "海克斯品质"))
-            body = "RSP:" + g_hex + "\n";
-        else if (strstr(p, "三星预警"))
-            body = "RSP:" + g_warn + "\n";
-        else if (strstr(p, "头像位置"))
-            body = "RSP:" + g_pos + "\n";
-        else if (strstr(p, "对手预测"))
-            body = "RSP:" + g_pred + "\n";
-        else if (strstr(p, "转区"))
-            body = "RSP:0\n";
-        else
-            body = "RSP:EMPTY\n";
-        pthread_mutex_unlock(&g_mu);
-        return body;
-    }
-    return "RSP:ERR unknown\n";
-}
-
-static void *server_thread(void *) {
-    JCKPT("server_thread_start");
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        set_status("FAIL socket");
-        return nullptr;
-    }
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(CTRL_PORT);
-    if (bind(fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
-        set_status("FAIL bind 31338");
-        close(fd);
-        return nullptr;
-    }
-    listen(fd, 8);
-    set_status("server 31338 full-protocol listening");
-
-    while (g_running.load()) {
-        int c = accept(fd, nullptr, nullptr);
-        if (c < 0) continue;
-        // 注册 push 客户端
-        pthread_mutex_lock(&g_clients_mu);
-        g_push_clients.push_back(c);
-        pthread_mutex_unlock(&g_clients_mu);
-
-        char req[1024]{};
-        ssize_t n = recv(c, req, sizeof(req) - 1, 0);
-        if (n > 0) {
-            char *line = req;
-            while (line && *line) {
-                char *nl = strchr(line, '\n');
-                if (nl) *nl = 0;
-                auto body = handle_request(line);
-                send(c, body.data(), body.size(), MSG_NOSIGNAL);
-                // 不关闭 — 但原 UI 短连接；短连接则下次 accept
-                if (!nl) break;
-                line = nl + 1;
-            }
+        std::lock_guard<std::mutex> lk(g_mu);
+        // 商店显示关闭时仍返回牌库（原 UI 自己控制窗口；数据不能空）
+        if (strstr(p, "牌库")) {
+            if (g_pool.empty())
+                return "RSP:\n";
+            return "RSP:" + g_pool + "\n";
         }
-        // 原版短连接：移除并关闭
-        pthread_mutex_lock(&g_clients_mu);
-        g_push_clients.erase(std::remove(g_push_clients.begin(), g_push_clients.end(), c),
-                             g_push_clients.end());
-        pthread_mutex_unlock(&g_clients_mu);
-        close(c);
+        if (strstr(p, "日志")) return "RSP:" + g_log + "\n";
+        if (strstr(p, "海克斯品质")) return "RSP:" + g_hex + "\n";
+        if (strstr(p, "三星预警")) return "RSP:" + g_warn + "\n";
+        if (strstr(p, "头像位置")) return "RSP:" + g_pos + "\n";
+        if (strstr(p, "对手预测")) return "RSP:" + g_pred + "\n";
+        if (strstr(p, "转区")) return "RSP:0\n";
+        return "RSP:EMPTY\n";
     }
-    close(fd);
-    return nullptr;
+    return "RSP:ERR\n";
 }
 
-// 长连接 push 服务：额外端口无 — 原版 PUSH 与 GET 同连接
-// 原版 d0 读循环：同一 socket 上 RSP 与 PUSH
-// 改进：后台线程周期性向「最近活跃」写文件，UI 主要靠 GET 轮询
-// 对于站位：UI handlePush 需要 PUSH 行；短连接收不到
-// → 增加并行推送：在 GET 处理完后若有 board，附加不发；改用 keep-alive 连接列表
-// 简化：另开 31339 推送？UI 只连 31338。
-// 原版 SO 在同一连接上异步 PUSH。我们的 accept 短连接模式限制了 PUSH。
-// 修复：server 改为 select/多线程：连接保持直到对端关闭。
-
-static void *session_thread(void *arg) {
+static void *session(void *arg) {
     int c = (int)(intptr_t)arg;
-    pthread_mutex_lock(&g_clients_mu);
-    g_push_clients.push_back(c);
-    pthread_mutex_unlock(&g_clients_mu);
-    JLOGI("session open fd=%d", c);
-
     char buf[2048];
-    while (g_running.load()) {
+    while (g_run.load()) {
         ssize_t n = recv(c, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
         buf[n] = 0;
@@ -721,50 +499,45 @@ static void *session_thread(void *arg) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = 0;
             if (*line) {
-                auto body = handle_request(line);
+                auto body = handle(line);
                 if (send(c, body.data(), body.size(), MSG_NOSIGNAL) < 0) {
-                    line = nullptr;
-                    break;
+                    close(c);
+                    return nullptr;
                 }
             }
             if (!nl) break;
             line = nl + 1;
         }
     }
-    pthread_mutex_lock(&g_clients_mu);
-    g_push_clients.erase(std::remove(g_push_clients.begin(), g_push_clients.end(), c),
-                         g_push_clients.end());
-    pthread_mutex_unlock(&g_clients_mu);
     close(c);
-    JLOGI("session close fd=%d", c);
     return nullptr;
 }
 
-static void *server_thread_v2(void *) {
-    JCKPT("server_v2_start");
+static void *server(void *) {
+    JCKPT("server_start");
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        set_status("FAIL socket");
+        slog("FAIL socket");
         return nullptr;
     }
-    int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(CTRL_PORT);
-    if (bind(fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
-        set_status("FAIL bind 31338");
+    int y = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &y, sizeof(y));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(PORT);
+    if (bind(fd, (sockaddr *)&a, sizeof(a)) < 0) {
+        slog("FAIL bind 31338");
         close(fd);
         return nullptr;
     }
     listen(fd, 16);
-    set_status("server 31338 session-mode");
-    while (g_running.load()) {
+    slog("server 31338 ready (hybrid 2.6 no resource hooks)");
+    while (g_run.load()) {
         int c = accept(fd, nullptr, nullptr);
         if (c < 0) continue;
         pthread_t t;
-        pthread_create(&t, nullptr, session_thread, (void *)(intptr_t)c);
+        pthread_create(&t, nullptr, session, (void *)(intptr_t)c);
         pthread_detach(t);
     }
     close(fd);
@@ -773,73 +546,52 @@ static void *server_thread_v2(void *) {
 
 static void *worker(void *) {
     JCKPT("worker_start");
-    for (int i = 0; i < 90; i++) {
-        if (scan_cardpool_table()) break;
-        char st[64];
-        snprintf(st, sizeof(st), "wait tables %ds", (i + 1) * 2);
-        set_status(st);
+    for (int i = 0; i < 60; i++) {
+        if (scan_heroes()) break;
         sleep(2);
     }
     int tick = 0;
-    while (g_running.load()) {
+    while (g_run.load()) {
         sleep(2);
         tick++;
-        scan_battle_units();
-        refresh_hex();
-        refresh_positions();
-        try_auto_buy();
-        try_popup_block();
-        broadcast_board();
-        if ((tick % 60) == 0) {
-            scan_cardpool_table();
-            JCKPT("worker_periodic_rescan");
+        if (g_shop_show.load() || g_pool.empty()) {
+            if ((tick % 30) == 0) scan_heroes();
         }
-        if ((tick % 15) == 0) {
-            JLOGI("heartbeat tick=%d pool_bytes=%zu owned=%zu op_board=%d", tick, g_pool.size(),
-                  g_owned.size(), (int)g_op_board.load());
+        refresh_opponent();
+        refresh_hex();
+        try_auto_buy();
+        if ((tick % 10) == 0) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (!g_heroes.empty()) {
+                g_pool = build_pool();
+                save_pool(g_pool);
+            }
+            JLOGI("hb pool=%zu shop=%d auto=%d opp=%s", g_pool.size(), (int)g_shop_show.load(),
+                  (int)g_auto_buy.load(), g_opp_info.c_str());
         }
     }
-    JCKPT("worker_exit");
     return nullptr;
-}
-
-extern "C" void jcc_report_owned(int hero_id, int count) {
-    if (hero_id <= 0) return;
-    pthread_mutex_lock(&g_mu);
-    g_owned[hero_id] = count;
-    if (!g_heroes.empty()) g_pool = build_pool_payload_locked();
-    pthread_mutex_unlock(&g_mu);
-}
-
-extern "C" void jcc_report_hex(int a, int b, int c) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d,%d,%d", a & 3, b & 3, c & 3);
-    pthread_mutex_lock(&g_mu);
-    g_hex = buf;
-    pthread_mutex_unlock(&g_mu);
 }
 
 void cardpool_start(const char *game_data_dir) {
     if (!game_data_dir) return;
-    strncpy(g_data_dir, game_data_dir, sizeof(g_data_dir) - 1);
+    strncpy(g_dir, game_data_dir, sizeof(g_dir) - 1);
     JccFileLog::I().init(game_data_dir);
-    g_running.store(true);
-    JCKPT("cardpool_start");
-    set_status("full_kernel_start " JCC_SEASON_TAG);
+    g_run.store(true);
+    JCKPT("cardpool_start_2_6");
+    slog("hybrid_kernel_2.6_no_asset_hooks " JCC_SEASON_TAG);
 
     if (il2cpp_domain_get && il2cpp_thread_attach) {
-        auto domain = il2cpp_domain_get();
-        if (domain) {
-            il2cpp_thread_attach(domain);
-            set_status("il2cpp_thread_attach ok");
-            JCKPT("il2cpp_attached");
+        auto d = il2cpp_domain_get();
+        if (d) {
+            il2cpp_thread_attach(d);
+            slog("il2cpp_thread_attach ok");
         }
     }
 
-    pthread_t t1{}, t2{};
-    pthread_create(&t1, nullptr, server_thread_v2, nullptr);
+    pthread_t t1, t2;
+    pthread_create(&t1, nullptr, server, nullptr);
     pthread_detach(t1);
     pthread_create(&t2, nullptr, worker, nullptr);
     pthread_detach(t2);
-    JCKPT("threads_spawned");
 }
