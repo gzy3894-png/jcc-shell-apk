@@ -1,6 +1,6 @@
-// JCC 2.6.4 混合内核（不 hook 资源/加载）
-// - 自动买：TeamRecommend 阵容 HasHero / HeroAndEquipments.ContainsKey → ReqBuyHero（纯内存）
-// - 预测 battleState=4；海克斯无局 EMPTY；禁 FindObjectOfType
+// JCC 2.6.5 混合内核（不 hook 资源/加载）
+// - 三星预警：协议 rank,money,level,hp,name : hid,name,pieces,cost,9（对齐 UI 反编译）
+// - 自动买：阵容 HasHero；预测 state=4；禁 FindObjectOfType
 #include "cardpool.h"
 #include "il2cpp-class.h"
 #include "jcc_log.h"
@@ -542,7 +542,92 @@ static void collect_player_pieces(Il2CppObject *pm, std::map<int, int> &pieces,
     foreach_unit_list(*(Il2CppObject **)(b + JCC_PM_WAIT_UNITS), acc_unit, &acc);
 }
 
-// ---- 三星预警 ----
+// ---- 三星预警（对齐 BattleOverlayView.parseWarning / drawThreeStarWarning）----
+// 每人一段：
+//   |{rank1based},{money},{level},{hp},{name}:{hid},{name},{pieces},{cost},{max9};...
+// rank1based = 头像槽序号（UI 用 rank-1 对齐 parsePositions）
+// pieces = 1★=1 / 2★=3 / 3★=9 折算；UI 默认 pieces≥3 才画
+// cost = 费用 1–5；max 固定 9（三星）
+static int hero_cost_of(int hid) {
+    for (auto &h : g_heroes)
+        if (h.id == hid) return h.cost;
+    return 1;
+}
+
+static std::string hero_name_of(int hid, const std::map<int, std::string> &names) {
+    auto it = names.find(hid);
+    if (it != names.end() && !it->second.empty() && it->second != "?") return it->second;
+    for (auto &h : g_heroes)
+        if (h.id == hid && !h.name.empty()) return h.name;
+    return "?";
+}
+
+static std::string player_name_of(Il2CppObject *pm) {
+    if (!pm) return "";
+    auto *rd = *(Il2CppObject **)((char *)pm + JCC_PM_RANK_DATA);
+    if (!rd) return "";
+    auto *ns = *(Il2CppString **)((char *)rd + JCC_UMD_NAME);
+    std::string n = istr(ns);
+    scrub(n);
+    return n;
+}
+
+static int player_level_of(Il2CppObject *pm) {
+    if (!pm) return 1;
+    int lv = *(int *)((char *)pm + JCC_PM_MAX_HERO_NUM);
+    if (lv < 1 || lv > 20) lv = 1;
+    return lv;
+}
+
+// 收集局内所有 PlayerModel（GetAllPlayers 优先）
+static void collect_all_pms(Il2CppObject *battle, Il2CppClass *cbm,
+                            std::vector<Il2CppObject *> &out) {
+    out.clear();
+    if (!battle || !cbm) return;
+    auto mAll = meth(cbm, "GetAllPlayers", 0);
+    if (mAll) {
+        auto list = inv(mAll, battle, nullptr);
+        void *items = nullptr;
+        int size = 0;
+        if (list_view(list, &items, &size)) {
+            if (size > 16) size = 16;
+            for (int i = 0; i < size; i++) {
+                auto *pm = list_obj_at(items, i);
+                if (pm) out.push_back(pm);
+            }
+            if (!out.empty()) return;
+        }
+    }
+    // fallback: chairIDList @0x170 + my/match/lastEnemy
+    std::map<int, Il2CppObject *> uniq;
+    auto add = [&](Il2CppObject *pm) {
+        if (!pm) return;
+        int pid = *(int *)((char *)pm + JCC_PM_PLAYER_ID);
+        if (pid < 0) return;
+        uniq[pid] = pm;
+    };
+    add(get_my_pm(battle, cbm));
+    int myId = get_my_id(battle, cbm);
+    int matchId = get_match_id(battle, cbm, myId);
+    if (matchId >= 0) add(get_player(battle, cbm, matchId));
+    auto my = get_my_pm(battle, cbm);
+    if (my) {
+        int le = *(int *)((char *)my + JCC_PM_LAST_ENEMY);
+        if (le >= 0) add(get_player(battle, cbm, le));
+    }
+    auto *chairs = *(Il2CppObject **)((char *)battle + JCC_CBM_CHAIR_LIST);
+    void *items = nullptr;
+    int size = 0;
+    if (list_view(chairs, &items, &size)) {
+        if (size > 16) size = 16;
+        for (int i = 0; i < size; i++) {
+            int pid = list_i32_at(items, i);
+            if (pid >= 0) add(get_player(battle, cbm, pid));
+        }
+    }
+    for (auto &kv : uniq) out.push_back(kv.second);
+}
+
 static void refresh_warning() {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
@@ -551,81 +636,91 @@ static void refresh_warning() {
         g_warn = "EMPTY";
         return;
     }
-    // iterate playerModelDict if available; else my + match only
+
+    std::vector<Il2CppObject *> pms;
+    collect_all_pms(battle, cbm, pms);
+    if (pms.empty()) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_warn = "EMPTY";
+        return;
+    }
+
+    // 前缀任意非空；UI 从 split("|")[1..] 读
     std::string out = "1";
     int added = 0;
 
-    auto emit_pm = [&](Il2CppObject *pm) {
-        if (!pm) return;
+    for (auto *pm : pms) {
+        if (!pm) continue;
         char *b = (char *)pm;
         int pid = *(int *)(b + JCC_PM_PLAYER_ID);
         int money = *(int *)(b + JCC_PM_MONEY);
         int hp = *(int *)(b + JCC_PM_HP);
+        int level = player_level_of(pm);
+        // rank：优先 GetPlayerRankByID（0-based），再字段 Rank@0x4c
+        int rank0 = get_rank(battle, cbm, pid);
+        if (rank0 < 0 || rank0 > 7) {
+            rank0 = *(int *)(b + JCC_PM_RANK);
+            if (rank0 < 0 || rank0 > 7) continue;
+        }
+        int rank1 = rank0 + 1; // UI 1-based
+
         std::map<int, int> pieces;
         std::map<int, std::string> names;
         collect_player_pieces(pm, pieces, &names);
+
         std::string heroes;
         for (auto &kv : pieces) {
-            if (kv.second < 3) continue; // only near/ready 2-3 star
-            std::string nm = names.count(kv.first) ? names[kv.first] : "?";
-            // resolve name from table if missing
-            if (nm == "?" || nm.empty()) {
-                for (auto &h : g_heroes)
-                    if (h.id == kv.first) {
-                        nm = h.name;
-                        break;
-                    }
-            }
+            if (kv.second < 3) continue; // 接近二星/三星才报
+            int hid = kv.first;
+            int pcs = kv.second;
+            if (pcs > 9) pcs = 9;
+            int cost = hero_cost_of(hid);
+            if (cost < 1 || cost > 5) cost = 1;
+            std::string nm = hero_name_of(hid, names);
             scrub(nm);
-            char hb[128];
-            snprintf(hb, sizeof(hb), "%d,%s,%d,0,0", kv.first, nm.c_str(), kv.second);
+            char hb[160];
+            // hid,name,pieces,cost,max(=9 for 3★)
+            snprintf(hb, sizeof(hb), "%d,%s,%d,%d,9", hid, nm.c_str(), pcs, cost);
             if (!heroes.empty()) heroes.push_back(';');
             heroes.append(hb);
         }
-        if (heroes.empty()) return;
-        char head[64];
-        snprintf(head, sizeof(head), "|%d,%d,%d:", pid, money, hp);
+        if (heroes.empty()) continue;
+
+        std::string pname = player_name_of(pm);
+        if (pname.empty()) pname = "?";
+        scrub(pname);
+
+        char head[128];
+        // rank,money,level,hp,name
+        snprintf(head, sizeof(head), "|%d,%d,%d,%d,%s:", rank1, money, level, hp, pname.c_str());
         out.append(head);
         out.append(heroes);
         added++;
-    };
-
-    auto my = get_my_pm(battle, cbm);
-    emit_pm(my);
-    int myId = get_my_id(battle, cbm);
-    int matchId = get_match_id(battle, cbm, myId);
-    if (matchId >= 0 && matchId != myId) emit_pm(get_player(battle, cbm, matchId));
-
-    // also scan dict values via known match list slots is hard without dictionary iter;
-    // my+match covers warning UI primary use
+    }
 
     {
         std::lock_guard<std::mutex> lk(g_mu);
         g_warn = added > 0 ? out : "EMPTY";
     }
+    if (added > 0) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "warn players=%d pms=%zu", added, pms.size());
+        JLOGI("%s", msg);
+    }
 }
 
-// ---- owned counts (rem) ----
+// ---- owned counts (rem) — 全员 pieces 汇总 ----
 static void refresh_owned() {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
     if (!battle) return;
     std::map<int, int> total;
-    auto add_pm = [&](Il2CppObject *pm) {
+    std::vector<Il2CppObject *> pms;
+    collect_all_pms(battle, cbm, pms);
+    for (auto *pm : pms) {
         std::map<int, int> p;
         collect_player_pieces(pm, p, nullptr);
         for (auto &kv : p) total[kv.first] += kv.second;
-    };
-    add_pm(get_my_pm(battle, cbm));
-    int myId = get_my_id(battle, cbm);
-    // try rank 0..7 players via GetPlayer if id known from GetMatch chain only is incomplete;
-    // use LastEnemy + match + my
-    int matchId = get_match_id(battle, cbm, myId);
-    if (matchId >= 0) add_pm(get_player(battle, cbm, matchId));
-    auto mypm = get_my_pm(battle, cbm);
-    if (mypm) {
-        int le = *(int *)((char *)mypm + JCC_PM_LAST_ENEMY);
-        if (le >= 0 && le != myId && le != matchId) add_pm(get_player(battle, cbm, le));
     }
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -1214,8 +1309,8 @@ void cardpool_start(const char *game_data_dir) {
     strncpy(g_dir, game_data_dir, sizeof(g_dir) - 1);
     JccFileLog::I().init(game_data_dir);
     g_run.store(true);
-    JCKPT("cardpool_start_2_6_4");
-    slog("hybrid_kernel_" JCC_SEASON_TAG " lineup-HasHero+dict " JCC_SEASON_SCAN_DATE);
+    JCKPT("cardpool_start_2_6_5");
+    slog("hybrid_kernel_" JCC_SEASON_TAG " warn-rank+lineup-buy " JCC_SEASON_SCAN_DATE);
 
     if (il2cpp_domain_get && il2cpp_thread_attach) {
         auto d = il2cpp_domain_get();

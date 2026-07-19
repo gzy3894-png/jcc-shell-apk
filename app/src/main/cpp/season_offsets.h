@@ -1,7 +1,7 @@
 /* JCC season fields — dump.cs + scan + 用户确认：自动买=阵容内存匹配 */
 #pragma once
 
-#define JCC_SEASON_TAG "2.6.4"
+#define JCC_SEASON_TAG "2.6.5"
 #define JCC_SEASON_SCAN_DATE "2026-07-19"
 
 /* TACG_Hero_Client (MATCH original SO 0x7e4bc) */
@@ -16,9 +16,13 @@
 /* PlayerModel (scan + dump MATCH) */
 #define JCC_PM_BATTLE_TURN 0x20
 #define JCC_PM_HEX_AUGMENT 0x28
+#define JCC_PM_RANK 0x4c              /* Rank 0-based；预警用 rank+1 */
 #define JCC_PM_MONEY 0x5c
 #define JCC_PM_LAST_ENEMY 0x64
+#define JCC_PM_RANK_DATA 0x78         /* TAC_UserMatchData* → strName@0x20 */
 #define JCC_PM_HP 0xbc
+#define JCC_PM_HP_MAX 0xd0
+#define JCC_PM_MAX_HERO_NUM 0xf0      /* 人口/等级 Lv */
 #define JCC_PM_BUY_HERO_DICT 0x108
 #define JCC_PM_HA_STORE_S6 0x128
 #define JCC_PM_ACTIVE_HA_IDS 0x148
@@ -28,6 +32,9 @@
 #define JCC_PM_UNIT_DICT 0x278
 #define JCC_PM_WAIT_UNITS 0x388
 #define JCC_PM_BATTLE_UNITS 0x390
+
+/* TAC_UserMatchData */
+#define JCC_UMD_NAME 0x20             /* strName */
 
 /* UnitData (scan MATCH — board without LoadBody) */
 #define JCC_UD_HERO_ID 0x14
@@ -65,6 +72,7 @@
 /* ChessBattleModel */
 #define JCC_CBM_PLAYER_DICT 0x38
 #define JCC_CBM_CUR_TURN 0x130
+#define JCC_CBM_CHAIR_LIST 0x170
 #define JCC_CBM_PLAYBOOK_ID 0x1e8
 #define JCC_CBM_MY_MATCH_LIST 0x268
 
