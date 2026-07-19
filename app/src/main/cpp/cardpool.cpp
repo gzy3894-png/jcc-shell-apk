@@ -1,8 +1,8 @@
 // =============================================================================
-// JCC Full-Kernel full-1.0.0  (side branch: dump-backed full features)
+// JCC Full-Kernel full-1.0.0  side branch: dump-backed full features
 // Spec: workspace/jcc-full-kernel/FEATURES.md PROTOCOL.md MEMORY.md
 // F1 pool F2 lineup-buy F3 predict F4 positions F5 warn F6 hex F7 board
-// F8 shop-flag F9 log F10 no asset hooks | NO: region-switch / FindObjectOfType / Unity.Screen
+// F8 shop F9 log F10 no asset hooks | NO region-switch / FindObjectOfType / Unity.Screen
 // =============================================================================
 #include "cardpool.h"
 #include "il2cpp-class.h"
@@ -46,7 +46,7 @@ static int g_ncli = 0;
 static std::string g_pool;
 static std::string g_status = "init";
 static std::string g_log;
-static std::string g_hex = "EMPTY"; // UI: �?EMPTY 才当 inBattle
+static std::string g_hex = "EMPTY"; // UI: 非 EMPTY 才当 inBattle
 static std::string g_warn = "EMPTY";
 static std::string g_pos = "EMPTY";
 static std::string g_pred = "EMPTY";
@@ -57,8 +57,9 @@ static std::string g_lineup_dbg = "none";
 static std::atomic<bool> g_auto_buy{false};
 static std::atomic<bool> g_popup_block{false};
 static std::atomic<bool> g_shop_show{true};
-// 默认关：PUSH 站位会走 FloatingService.showOpponentBoard，未开覆盖层时易踩 UI 空指�?static std::atomic<bool> g_op_board{false};
-static std::atomic<bool> g_overlay_ready{false}; // hex/pos/pred 成套就绪后才�?UI inBattle
+// 默认关：PUSH 站位会走 FloatingService.showOpponentBoard，未开覆盖层时易踩 UI 空指针
+static std::atomic<bool> g_op_board{false};
+static std::atomic<bool> g_overlay_ready{false}; // hex/pos/pred 成套就绪后才让 UI inBattle
 
 struct Hero {
     int id{}, cost{}, total{}, rem{};
@@ -308,7 +309,7 @@ static int get_match_id(Il2CppObject *battle, Il2CppClass *cbm, int myId) {
 
 static int get_rank(Il2CppObject *battle, Il2CppClass *cbm, int pid) {
     if (!battle || !cbm || !pid_ok(pid)) return -1;
-    // 优先�?PlayerModel.Rank@0x4c
+    // 优先读 PlayerModel.Rank@0x4c
     auto pm = get_player(battle, cbm, pid);
     if (pm) {
         int r = *(int *)((char *)pm + JCC_PM_RANK);
@@ -323,7 +324,8 @@ static int get_rank(Il2CppObject *battle, Il2CppClass *cbm, int pid) {
     return -1;
 }
 
-// 禁止后台线程�?UnityEngine.Screen（会闪退�?static void screen_size(int *w, int *h) {
+// 禁止后台线程调 UnityEngine.Screen（会闪退）
+static void screen_size(int *w, int *h) {
     *w = 1080;
     *h = 2400;
 }
@@ -476,7 +478,9 @@ static void read_ha_ids(Il2CppObject *list, int *out, int maxn, int *n_out) {
 }
 
 static void refresh_hex() {
-    // UI: 海克斯品质非 EMPTY �?inBattle，会立刻 GET 预测/头像/预警�?    // 未成套就绪时必须 EMPTY，否则一点「预测覆盖层」就进重解析路径 �?闪退风险�?    Il2CppClass *cbm = nullptr;
+    // UI: 海克斯品质非 EMPTY → inBattle，会立刻 GET 预测/头像/预警。
+    // 未成套就绪时必须 EMPTY，否则一点「预测覆盖层」就进重解析路径 → 闪退风险。
+    Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
     auto pm = battle ? get_my_pm(battle, cbm) : nullptr;
     int myId = battle ? get_my_id(battle, cbm) : -1;
@@ -502,7 +506,8 @@ static void refresh_hex() {
     char buf[32];
     snprintf(buf, sizeof(buf), "%d,%d,%d", q[0], q[1], q[2]);
 
-    // 仅当头像位置已写出时才开�?inBattle（覆盖层成套�?    bool pos_ok = false;
+    // 仅当头像位置已写出时才开放 inBattle（覆盖层成套）
+    bool pos_ok = false;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         pos_ok = !g_pos.empty() && g_pos != "EMPTY" && g_pos.find('x') != std::string::npos;
@@ -563,11 +568,12 @@ static void collect_player_pieces(Il2CppObject *pm, std::map<int, int> &pieces,
     foreach_unit_list(*(Il2CppObject **)(b + JCC_PM_WAIT_UNITS), acc_unit, &acc);
 }
 
-// ---- 三星预警（对�?BattleOverlayView.parseWarning / drawThreeStarWarning�?---
+// ---- 三星预警（对齐 BattleOverlayView.parseWarning / drawThreeStarWarning）----
 // 每人一段：
 //   |{rank1based},{money},{level},{hp},{name}:{hid},{name},{pieces},{cost},{max9};...
-// rank1based = 头像槽序号（UI �?rank-1 对齐 parsePositions�?// pieces = 1�?1 / 2�?3 / 3�?9 折算；UI 默认 pieces�? 才画
-// cost = 费用 1�?；max 固定 9（三星）
+// rank1based = 头像槽序号（UI 用 rank-1 对齐 parsePositions）
+// pieces = 1★=1 / 2★=3 / 3★=9 折算；UI 默认 pieces≥3 才画
+// cost = 费用 1–5；max 固定 9（三星）
 static int hero_cost_of(int hid) {
     for (auto &h : g_heroes)
         if (h.id == hid) return h.cost;
@@ -599,7 +605,8 @@ static int player_level_of(Il2CppObject *pm) {
     return lv;
 }
 
-// 收集 PlayerModel：不�?GetAllPlayers（后�?invoke 易闪退�?// �?my + match/enemy 字段 + chair 列表有限 GetPlayer
+// 收集 PlayerModel：不用 GetAllPlayers（后台 invoke 易闪退）
+// 仅 my + match/enemy 字段 + chair 列表有限 GetPlayer
 static void collect_all_pms(Il2CppObject *battle, Il2CppClass *cbm,
                             std::vector<Il2CppObject *> &out) {
     out.clear();
@@ -653,7 +660,8 @@ static void refresh_warning() {
         return;
     }
 
-    // 前缀任意非空；UI �?split("|")[1..] �?    std::string out = "1";
+    // 前缀任意非空；UI 从 split("|")[1..] 读
+    std::string out = "1";
     int added = 0;
 
     for (auto *pm : pms) {
@@ -663,7 +671,7 @@ static void refresh_warning() {
         int money = *(int *)(b + JCC_PM_MONEY);
         int hp = *(int *)(b + JCC_PM_HP);
         int level = player_level_of(pm);
-        // rank：优�?GetPlayerRankByID�?-based），再字�?Rank@0x4c
+        // rank：优先 GetPlayerRankByID（0-based），再字段 Rank@0x4c
         int rank0 = get_rank(battle, cbm, pid);
         if (rank0 < 0 || rank0 > 7) {
             rank0 = *(int *)(b + JCC_PM_RANK);
@@ -686,7 +694,7 @@ static void refresh_warning() {
             std::string nm = hero_name_of(hid, names);
             scrub(nm);
             char hb[160];
-            // hid,name,pieces,cost,max(=9 for 3�?
+            // hid,name,pieces,cost,max(=9 for 3★)
             snprintf(hb, sizeof(hb), "%d,%s,%d,%d,9", hid, nm.c_str(), pcs, cost);
             if (!heroes.empty()) heroes.push_back(';');
             heroes.append(hb);
@@ -716,7 +724,7 @@ static void refresh_warning() {
     }
 }
 
-// ---- owned counts (rem) �?全员 pieces 汇�?----
+// ---- owned counts (rem) — 全员 pieces 汇总 ----
 static void refresh_owned() {
     Il2CppClass *cbm = nullptr;
     auto battle = get_battle(&cbm);
@@ -736,7 +744,7 @@ static void refresh_owned() {
     }
 }
 
-// ---- 对手预测（UI �?�? �?':' 字段�?---
+// ---- 对手预测（UI 要 ≥9 个 ':' 字段）----
 // parsePrediction: [4]=myRankIdx [6]=battleState [7]=turn [9]=oppRank1based
 // drawOpponentPrediction: 仅当 battleState == 4 时画剑标
 static void refresh_opponent() {
@@ -780,7 +788,7 @@ static void refresh_opponent() {
         }
     }
     int oppRank1 = (oppRank >= 0) ? (oppRank + 1) : 0;
-    // battleState=4 才画剑；无合法对�?rank �?EMPTY（勿发脏包）
+    // battleState=4 才画剑；无合法对手 rank 则 EMPTY（勿发脏包）
     int state = (oppRank1 >= 1 && oppRank1 <= 8) ? 4 : 0;
 
     char info[256];
@@ -800,8 +808,8 @@ static void refresh_opponent() {
     if (state) JLOGI("%s", info);
 }
 
-// ---- 头像位置：右侧几�?8 槽（�?FindObjectOfType / �?Unity.Screen�?---
-// UI: "{W}x{H}:{count}[:opIdx]|x,y,isSelf|..."  y 底原点；x 必须 �?2/3 W
+// ---- 头像位置：右侧几何 8 槽（无 FindObjectOfType / 无 Unity.Screen）----
+// UI: "{W}x{H}:{count}[:opIdx]|x,y,isSelf|..."  y 底原点；x 必须 ≥ 2/3 W
 static void refresh_positions() {
     int W = 1080, H = 2400;
     screen_size(&W, &H);
@@ -836,7 +844,7 @@ static void refresh_positions() {
     }
 
     int n = 8;
-    // 必须 �?0.6667W，否�?parsePositions 直接丢弃
+    // 必须 ≥ 0.6667W，否则 parsePositions 直接丢弃
     float x = (float)W * 0.90f;
     char head[64];
     int opIdx = (oppRank >= 0 && oppRank < n) ? oppRank : -1;
@@ -860,7 +868,7 @@ static void refresh_positions() {
 }
 
 // ---- 对手站位 PUSH:OPPONENT_BOARD:W,H|x,y,cost,star,heroId,icon|... ----
-// UnitData.col@0x30 row@0x34 �?�?LoadBody 也能读棋盘格
+// UnitData.col@0x30 row@0x34 — 无 LoadBody 也能读棋盘格
 static void refresh_opponent_board() {
     if (!g_op_board.load()) return;
     Il2CppClass *cbm = nullptr;
@@ -909,7 +917,7 @@ static void refresh_opponent_board() {
                     name = h.name;
                     break;
                 }
-            // grid �?logical board coords (center of cell)
+            // grid → logical board coords (center of cell)
             float x = ((float)col + 0.5f) / 7.0f * (float)BW;
             float y = ((float)row + 0.5f) / 4.0f * (float)BH;
             scrub(icon);
@@ -937,10 +945,10 @@ static void refresh_opponent_board() {
     JLOGI("%s", msg);
 }
 
-// ---- 金铲铲自带阵�?TeamRecommend（纯内存，用户确认）----
+// ---- 金铲铲自带阵容 TeamRecommend（纯内存，用户确认）----
 // TeamRecommendController(Singleton)._teamRecommendModel
-//   �?CurrentStageRecommendData @0x50
-//   �?StageRecommendTeamData.HasHero(heroId) / CoreHeroId / HeroAndEquipments
+//   → CurrentStageRecommendData @0x50
+//   → StageRecommendTeamData.HasHero(heroId) / CoreHeroId / HeroAndEquipments
 static Il2CppObject *get_team_recommend_model() {
     Il2CppClass *trc = find_class("ZGameChess", "TeamRecommendController");
     if (!trc) trc = find_class("", "TeamRecommendController");
@@ -983,7 +991,8 @@ static bool dict_contains_int(Il2CppObject *dict, int key) {
     return r ? unbox_bool(r) : false;
 }
 
-// 当前应用阵容是否包含该英�?conf id（纯内存�?static bool lineup_has_hero(Il2CppObject *stage, int heroId) {
+// 当前应用阵容是否包含该英雄 conf id（纯内存）
+static bool lineup_has_hero(Il2CppObject *stage, int heroId) {
     if (!stage || heroId <= 0) return false;
     Il2CppClass *sr = find_class("ZGameChess", "StageRecommendTeamData");
     if (!sr) sr = find_class("", "StageRecommendTeamData");
@@ -1002,14 +1011,15 @@ static bool dict_contains_int(Il2CppObject *dict, int key) {
             auto r = inv(m2, stage, p);
             if (r && unbox_bool(r)) return true;
         }
-        // GetHeroDataDic �?ContainsKey
+        // GetHeroDataDic → ContainsKey
         auto m3 = meth(sr, "GetHeroDataDic", 0);
         if (m3) {
             auto dic = inv(m3, stage, nullptr);
             if (dic && dict_contains_int(dic, heroId)) return true;
         }
     }
-    // HeroAndEquipments @0x10 直接 ContainsKey（阵容英雄表�?    auto *he = *(Il2CppObject **)((char *)stage + JCC_SRTD_HERO_EQUIPS);
+    // HeroAndEquipments @0x10 直接 ContainsKey（阵容英雄表）
+    auto *he = *(Il2CppObject **)((char *)stage + JCC_SRTD_HERO_EQUIPS);
     if (he && dict_contains_int(he, heroId)) return true;
 
     int core = *(int *)((char *)stage + JCC_SRTD_CORE_HERO);
@@ -1017,7 +1027,7 @@ static bool dict_contains_int(Il2CppObject *dict, int key) {
     return false;
 }
 
-// ---- 商店槽：ChessBattleGlobal �?BattleScreenMgr �?GetBuyHeroView �?_listHeroRoot ----
+// ---- 商店槽：ChessBattleGlobal → BattleScreenMgr → GetBuyHeroView → _listHeroRoot ----
 // 禁止 FindObjectOfType（跨线程崩）
 static Il2CppObject *find_buy_hero_view() {
     Il2CppClass *cbg = find_class("ZGameChess", "ChessBattleGlobal");
@@ -1047,7 +1057,8 @@ static Il2CppObject *find_buy_hero_view() {
             }
         }
     }
-    // last resort: singleton only（无 FindObjectOfType�?    Il2CppClass *bv = find_class("ZGameChess", "BuyHeroView");
+    // last resort: singleton only（无 FindObjectOfType）
+    Il2CppClass *bv = find_class("ZGameChess", "BuyHeroView");
     if (!bv) bv = find_class("", "BuyHeroView");
     return bv ? singleton(bv) : nullptr;
 }
@@ -1090,9 +1101,10 @@ static int read_shop_slots(Il2CppObject **slots_out, int *ids_out, int maxn) {
 }
 
 // 自动拿牌 = 纯内存：
-// 1) 读当前应用阵�?StageRecommendTeamData
-// 2) 读商�?HeroRoot �?conf id
-// 3) 阵容含该英雄 �?HeroRoot.ReqBuyHero()（游戏自带买牌协议入口，�?UI 点击�?static void try_auto_buy() {
+// 1) 读当前应用阵容 StageRecommendTeamData
+// 2) 读商店 HeroRoot 槽 conf id
+// 3) 阵容含该英雄 → HeroRoot.ReqBuyHero()（游戏自带买牌协议入口，非 UI 点击）
+static void try_auto_buy() {
     if (!g_auto_buy.load()) return;
     static int cool;
     if ((++cool % 2) != 0) return; // ~4s @ 2s tick
@@ -1100,7 +1112,7 @@ static int read_shop_slots(Il2CppObject **slots_out, int *ids_out, int maxn) {
     auto stage = get_stage_recommend_data();
     if (!stage) {
         static int miss;
-        if ((++miss % 15) == 1) slog("auto_buy: no CurrentStageRecommendData (未应用阵�?)");
+        if ((++miss % 15) == 1) slog("auto_buy: no CurrentStageRecommendData (未应用阵容?)");
         {
             std::lock_guard<std::mutex> lk(g_mu);
             g_lineup_dbg = "no_stage";
@@ -1203,7 +1215,7 @@ static std::string handle(const char *req) {
             refresh_opponent_board();
             return "RSP:OK\n";
         }
-        if (strstr(p, "退出游�?)) return "RSP:OK\n";
+        if (strstr(p, "退出游戏")) return "RSP:OK\n";
         return "RSP:OK\n";
     }
 
@@ -1215,7 +1227,7 @@ static std::string handle(const char *req) {
             return "RSP:" + g_pool + "\n";
         }
         if (strstr(p, "日志")) return "RSP:" + g_log + "\n";
-        if (strstr(p, "海克斯品�?)) return "RSP:" + g_hex + "\n";
+        if (strstr(p, "海克斯品质")) return "RSP:" + g_hex + "\n";
         if (strstr(p, "三星预警")) return "RSP:" + g_warn + "\n";
         if (strstr(p, "头像位置")) return "RSP:" + g_pos + "\n";
         if (strstr(p, "对手预测")) return "RSP:" + g_pred + "\n";
@@ -1226,7 +1238,7 @@ static std::string handle(const char *req) {
 }
 
 static void *session(void *arg) {
-    // 会话线程只回缓存字符串，�?attach/�?invoke，避免多线程 IL2CPP 闪退
+    // 会话线程只回缓存字符串，不 attach/不 invoke，避免多线程 IL2CPP 闪退
     int c = (int)(intptr_t)arg;
     client_add(c);
     char buf[2048];
@@ -1301,7 +1313,8 @@ static void *worker(void *) {
         if (g_shop_show.load() || g_pool.empty()) {
             if ((tick % 30) == 0) scan_heroes();
         }
-        // 顺序：先 pos/pred，再 hex（hex 依赖 pos 就绪才放�?inBattle�?        refresh_positions();
+        // 顺序：先 pos/pred，再 hex（hex 依赖 pos 就绪才放行 inBattle）
+        refresh_positions();
         refresh_opponent();
         refresh_hex();
         if ((tick % 2) == 0) refresh_warning();
@@ -1336,7 +1349,7 @@ void cardpool_start(const char *game_data_dir) {
     JccFileLog::I().init(game_data_dir);
     g_run.store(true);
     JCKPT("full_kernel_1_0_0_start");
-    slog("FULL_KERNEL_" JCC_SEASON_TAG " F1-F10 dump-backed " JCC_SEASON_SCAN_DATE);
+    slog("FULL_KERNEL_" JCC_SEASON_TAG " overlay-safe no-UnityScreen " JCC_SEASON_SCAN_DATE);
 
     if (il2cpp_domain_get && il2cpp_thread_attach) {
         auto d = il2cpp_domain_get();

@@ -3,7 +3,7 @@
 
 #define JCC_SEASON_TAG "full-1.0.0"
 #define JCC_SEASON_SCAN_DATE "2026-07-19"
-/* 支线 jcc-full-kernel：功能复现自 dump，非猜接口 */
+/* branch jcc-full-kernel: dump-backed F1-F10 */
 
 /* TACG_Hero_Client (MATCH original SO 0x7e4bc) */
 #define JCC_HERO_IID 0x10
