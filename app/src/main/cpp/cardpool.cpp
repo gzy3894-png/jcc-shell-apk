@@ -1182,7 +1182,12 @@ static void try_auto_buy() {
 
 static std::string handle(const char *req) {
     if (!req || !*req) { JERRF("PROTO", "empty_req"); return "RSP:ERR\n"; }
-    JLOGI("REQ %s", req);
+    // 每个请求进内存日志 → Controller「日志」页可见，不依赖手机文件
+    {
+        char line[200];
+        snprintf(line, sizeof(line), "REQ %.160s", req ? req : "");
+        slog(line);
+    }
 
     if (strncmp(req, "SET:", 4) == 0) {
         const char *p = req + 4;
@@ -1236,13 +1241,21 @@ static std::string handle(const char *req) {
         const char *p = req + 4;
         std::lock_guard<std::mutex> lk(g_mu);
         if (strstr(p, "牌库")) {
+            // 有牌库请求 = 我们的协议栈在跑
+            char note[80];
+            snprintf(note, sizeof(note), "GET_pool size=%zu tag=%s", g_pool.size(), JCC_SEASON_TAG);
+            // g_mu already held — append carefully
+            if (g_log.size() > 40 * 1024) g_log.erase(0, 20 * 1024);
+            g_log.append(note);
+            g_log.push_back('\n');
             if (g_pool.empty()) return "RSP:\n";
             return "RSP:" + g_pool + "\n";
         }
         if (strstr(p, "日志")) {
-            // 日志开头永远带版本，Controller「日志」页可确认注入
-            std::string ver = std::string("KERNEL=") + JCC_SEASON_TAG + " log=" +
-                              (JccFileLog::I().path() ? JccFileLog::I().path() : "?") + "\n";
+            // 不依赖磁盘；只要我们的 SO 在答 31338，这里必有 KERNEL=
+            std::string ver = std::string("KERNEL=") + JCC_SEASON_TAG +
+                              " filelog=" + JccFileLog::I().path() +
+                              " pool=" + std::to_string(g_pool.size()) + "\n";
             return "RSP:" + ver + g_log + "\n";
         }
         if (strstr(p, "海克斯品质")) return "RSP:" + g_hex + "\n";

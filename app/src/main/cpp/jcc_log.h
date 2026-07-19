@@ -1,8 +1,9 @@
 #pragma once
-// 游戏进程可写路径（Download 经常写不进，别用）
-// 只维护最多 2 个文件：files/jcc.log + /data/local/tmp/jcc.log
+// 尽量写进游戏能写的路径；同时业务侧用 GET:日志（内存）不依赖文件
 #include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -18,31 +19,22 @@ public:
     void init(const char * /*ignored*/) {
         std::lock_guard<std::mutex> lk(mu_);
         if (inited_) return;
-        // 候选：游戏 files（进程一定能写）+ tmp
         const char *cands[] = {
             "/data/user/0/com.tencent.jkchess/files/jcc.log",
             "/data/data/com.tencent.jkchess/files/jcc.log",
+            "/sdcard/Android/data/com.tencent.jkchess/files/jcc.log",
+            "/storage/emulated/0/Android/data/com.tencent.jkchess/files/jcc.log",
             "/data/local/tmp/jcc.log",
             nullptr,
         };
         primary_.clear();
         secondary_.clear();
         for (int i = 0; cands[i]; i++) {
-            // 确保 files 目录存在
-            std::string p = cands[i];
-            auto slash = p.rfind('/');
-            if (slash != std::string::npos) {
-                std::string dir = p.substr(0, slash);
-                mkdir(dir.c_str(), 0777);
-            }
-            FILE *f = fopen(cands[i], "a");
-            if (!f) continue;
-            fprintf(f, "\n==== BOOT %ld pid=%d ====\n", (long)time(nullptr), (int)getpid());
-            fflush(f);
-            fclose(f);
+            ensure_parent(cands[i]);
+            if (!try_write(cands[i], "\n==== BOOT ====\n")) continue;
             if (primary_.empty())
                 primary_ = cands[i];
-            else if (secondary_.empty() && primary_ != cands[i])
+            else if (secondary_.empty())
                 secondary_ = cands[i];
         }
         inited_ = true;
@@ -50,12 +42,33 @@ public:
 
     void log(const char *level, const char *msg) {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!inited_) init(nullptr);
+        if (!inited_) {
+            // 允许未 init 时直接尝试
+            inited_ = true;
+        }
         char line[900];
         snprintf(line, sizeof(line), "[%ld][%s] %s\n", (long)time(nullptr), level ? level : "?",
                  msg ? msg : "");
-        write_one(primary_.c_str(), line);
-        if (!secondary_.empty()) write_one(secondary_.c_str(), line);
+        if (primary_.empty()) {
+            // 每次失败再试一遍路径
+            const char *cands[] = {
+                "/data/user/0/com.tencent.jkchess/files/jcc.log",
+                "/data/data/com.tencent.jkchess/files/jcc.log",
+                "/sdcard/Android/data/com.tencent.jkchess/files/jcc.log",
+                "/data/local/tmp/jcc.log",
+                nullptr,
+            };
+            for (int i = 0; cands[i]; i++) {
+                ensure_parent(cands[i]);
+                if (try_write(cands[i], line)) {
+                    primary_ = cands[i];
+                    break;
+                }
+            }
+        } else {
+            try_write(primary_.c_str(), line);
+            if (!secondary_.empty()) try_write(secondary_.c_str(), line);
+        }
     }
 
     void checkpoint(const char *name) {
@@ -65,7 +78,7 @@ public:
     }
 
     const char *path() const {
-        return primary_.empty() ? "(no-writable-log-path)" : primary_.c_str();
+        return primary_.empty() ? "none" : primary_.c_str();
     }
 
 private:
@@ -74,13 +87,40 @@ private:
     std::string secondary_;
     bool inited_{false};
 
-    static void write_one(const char *path, const char *line) {
-        if (!path || !path[0] || !line) return;
-        FILE *f = fopen(path, "a");
-        if (!f) return;
-        fputs(line, f);
-        fflush(f);
-        fclose(f);
+    static void ensure_parent(const char *path) {
+        if (!path) return;
+        std::string p = path;
+        auto slash = p.rfind('/');
+        if (slash == std::string::npos) return;
+        std::string dir = p.substr(0, slash);
+        // 逐级 mkdir
+        for (size_t i = 1; i < dir.size(); i++) {
+            if (dir[i] == '/') {
+                dir[i] = 0;
+                mkdir(dir.c_str(), 0777);
+                dir[i] = '/';
+            }
+        }
+        mkdir(dir.c_str(), 0777);
+    }
+
+    static bool try_write(const char *path, const char *line) {
+        if (!path || !line) return false;
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd < 0) {
+            // fallback FILE*
+            FILE *f = fopen(path, "a");
+            if (!f) return false;
+            fputs(line, f);
+            fflush(f);
+            fclose(f);
+            return true;
+        }
+        size_t n = strlen(line);
+        (void)!write(fd, line, n);
+        fsync(fd);
+        close(fd);
+        return true;
     }
 };
 
